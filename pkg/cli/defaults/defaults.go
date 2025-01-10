@@ -11,13 +11,17 @@ import (
 	"google.golang.org/grpc/grpclog"
 )
 
-func Set(clx *cli.Context, dataDir string) error {
+func Set(_ *cli.Context, dataDir string) error {
+	if err := createDataDir(dataDir, 0755); err != nil {
+		return errors.Wrapf(err, "failed to create directory %s", dataDir)
+	}
+
 	logsDir := filepath.Join(dataDir, "agent", "logs")
-	if err := os.MkdirAll(logsDir, 0755); err != nil {
+	if err := os.MkdirAll(logsDir, 0750); err != nil {
 		return errors.Wrapf(err, "failed to create directory %s", logsDir)
 	}
 
-	cmds.ServerConfig.DatastoreEndpoint = "etcd"
+	cmds.ServerConfig.ClusterInit = true
 	cmds.ServerConfig.DisableNPC = true
 	cmds.ServerConfig.FlannelBackend = "none"
 	cmds.ServerConfig.AdvertisePort = 6443
@@ -25,10 +29,9 @@ func Set(clx *cli.Context, dataDir string) error {
 	cmds.ServerConfig.HTTPSPort = 6443
 	cmds.ServerConfig.APIServerPort = 6443
 	cmds.ServerConfig.APIServerBindAddress = "0.0.0.0"
-	cmds.AgentConfig.NoFlannel = true
 	cmds.ServerConfig.ExtraAPIArgs = append(
 		[]string{
-			"enable-admission-plugins=NodeRestriction,PodSecurityPolicy",
+			"enable-admission-plugins=NodeRestriction",
 		},
 		cmds.ServerConfig.ExtraAPIArgs...)
 	cmds.AgentConfig.ExtraKubeletArgs = append(

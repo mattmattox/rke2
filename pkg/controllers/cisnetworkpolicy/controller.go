@@ -7,7 +7,7 @@ import (
 
 	"github.com/k3s-io/k3s/pkg/server"
 	"github.com/pkg/errors"
-	coreclient "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	coreclient "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	core "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
@@ -34,7 +34,7 @@ func register(ctx context.Context,
 		ctx: ctx,
 		k8s: k8s,
 	}
-	logrus.Debugf("CISNetworkPolicyController: Registering controller hooks")
+	logrus.Debugf("CISNetworkPolicyController: Registering controller hooks for NetworkPolicy %s", flannelHostNetworkPolicyName)
 	nodes.OnChange(ctx, "cisnetworkpolicy-node", h.handle)
 	nodes.OnRemove(ctx, "cisnetworkpolicy-node", h.handle)
 	return nil
@@ -53,7 +53,7 @@ func (h *handler) handle(key string, node *core.Node) (*core.Node, error) {
 	return h.reconcileFlannelHostNetworkPolicy(key, node)
 }
 
-func (h *handler) reconcileFlannelHostNetworkPolicy(nodeName string, node *core.Node) (*core.Node, error) {
+func (h *handler) reconcileFlannelHostNetworkPolicy(_ string, _ *core.Node) (*core.Node, error) {
 	var np *netv1.NetworkPolicy
 	var npIR *netv1.NetworkPolicyIngressRule
 

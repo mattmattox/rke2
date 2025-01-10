@@ -1,19 +1,17 @@
 package bootstrap
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 
-	"github.com/containerd/continuity/fs"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -23,21 +21,25 @@ import (
 	"github.com/k3s-io/k3s/pkg/daemons/agent"
 	daemonconfig "github.com/k3s-io/k3s/pkg/daemons/config"
 	"github.com/k3s-io/k3s/pkg/util"
+	"github.com/k3s-io/k3s/pkg/version"
 	"github.com/pkg/errors"
 	"github.com/rancher/rke2/pkg/images"
 	"github.com/rancher/wharfie/pkg/credentialprovider/plugin"
 	"github.com/rancher/wharfie/pkg/extract"
 	"github.com/rancher/wharfie/pkg/registries"
 	"github.com/rancher/wharfie/pkg/tarfile"
-	"github.com/rancher/wrangler/pkg/merr"
-	"github.com/rancher/wrangler/pkg/schemes"
+	"github.com/rancher/wrangler/v3/pkg/merr"
+	"github.com/rancher/wrangler/v3/pkg/yaml"
 	"github.com/sirupsen/logrus"
-	"k8s.io/apimachinery/pkg/runtime/serializer/json"
-	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 var (
-	releasePattern = regexp.MustCompile("^v[0-9]")
+	releasePattern      = regexp.MustCompile("^v[0-9]")
+	helmChartGVK        = helmv1.SchemeGroupVersion.WithKind("HelmChart")
+	injectAnnotationKey = version.Program + ".cattle.io/inject-cluster-config"
+	injectEnvKey        = version.ProgramUpper + "_INJECT_CLUSTER_CONFIG"
+	injectDefault       = true
 )
 
 // binDirForDigest returns the path to dataDir/data/refDigest/bin.
@@ -110,10 +112,12 @@ func Stage(resolver *images.Resolver, nodeConfig *daemonconfig.Node, cfg cmds.Ag
 		// If we didn't find the requested image in a tarball, pull it from the remote registry.
 		// Note that this will fail (potentially after a long delay) if the registry cannot be reached.
 		if img == nil {
-			registry, err := registries.GetPrivateRegistries(nodeConfig.AgentConfig.PrivateRegistry)
+			registry, err := registries.GetPrivateRegistries(cfg.PrivateRegistry)
 			if err != nil {
-				return "", errors.Wrapf(err, "failed to load private registry configuration from %s", nodeConfig.AgentConfig.PrivateRegistry)
+				return "", errors.Wrapf(err, "failed to load private registry configuration from %s", cfg.PrivateRegistry)
 			}
+			// Override registry config with version provided by (and potentially modified by) k3s agent setup
+			registry.Registry = nodeConfig.AgentConfig.Registry
 
 			// Try to enable Kubelet image credential provider plugins; fall back to legacy docker credentials
 			if agent.ImageCredProvAvailable(&nodeConfig.AgentConfig) {
@@ -127,6 +131,8 @@ func Stage(resolver *images.Resolver, nodeConfig *daemonconfig.Node, cfg cmds.Ag
 			}
 
 			logrus.Infof("Pulling runtime image %s", ref.Name())
+			// Make sure that the runtime image is also loaded into containerd
+			images.Pull(imagesDir, images.Runtime, ref)
 			img, err = registry.Image(ref, remote.WithPlatform(v1.Platform{Architecture: runtime.GOARCH, OS: runtime.GOOS}))
 			if err != nil {
 				return "", errors.Wrapf(err, "failed to get runtime image %s", ref.Name())
@@ -156,7 +162,7 @@ func Stage(resolver *images.Resolver, nodeConfig *daemonconfig.Node, cfg cmds.Ag
 
 // UpdateManifests copies the staged manifests into the server's manifests dir, and applies
 // cluster configuration values to any HelmChart manifests found in the manifests directory.
-func UpdateManifests(resolver *images.Resolver, nodeConfig *daemonconfig.Node, cfg cmds.Agent) error {
+func UpdateManifests(resolver *images.Resolver, ingressController string, nodeConfig *daemonconfig.Node, cfg cmds.Agent) error {
 	ref, err := resolver.GetReference(images.Runtime)
 	if err != nil {
 		return err
@@ -170,25 +176,20 @@ func UpdateManifests(resolver *images.Resolver, nodeConfig *daemonconfig.Node, c
 	refChartsDir := chartsDirForDigest(cfg.DataDir, refDigest)
 	manifestsDir := manifestsDir(cfg.DataDir)
 
-	// Ensure manifests directory exists
-	if err := os.MkdirAll(manifestsDir, 0755); err != nil && !os.IsExist(err) {
-		return err
-	}
-
 	// TODO - instead of copying over then rewriting the manifests, we should template them as we
 	// copy, only overwriting if they're different - and then make a second pass and rewrite any
 	// user-provided manifests that weren't just copied over. This will work better with the deploy
 	// controller's mtime-based change detection.
 
-	// Recursively copy all charts into the manifests directory, since the K3s
+	// Copy all charts into the manifests directory, since the K3s
 	// deploy controller will delete them if they are disabled.
-	if err := fs.CopyDir(manifestsDir, refChartsDir); err != nil {
+	if err := copyDir(manifestsDir, refChartsDir); err != nil {
 		return errors.Wrap(err, "failed to copy runtime charts")
 	}
 
 	// Fix up HelmCharts to pass through configured values.
 	// This needs to be done every time in order to sync values from the CLI
-	if err := setChartValues(manifestsDir, nodeConfig, cfg); err != nil {
+	if err := setChartValues(manifestsDir, ingressController, nodeConfig, cfg); err != nil {
 		return errors.Wrap(err, "failed to rewrite HelmChart manifests to pass through CLI values")
 	}
 	return nil
@@ -247,13 +248,68 @@ func preloadBootstrapFromRuntime(imagesDir string, resolver *images.Resolver) (v
 	return nil, nil
 }
 
+// copyDir recursively copies files from source to destination. If the target
+// file already exists, the current permissions, ownership, and xattrs will be
+// retained, but the contents will be overwritten.
+func copyDir(target, source string) error {
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %w", source, err)
+	}
+
+	if err := os.MkdirAll(target, 0755); err != nil && !os.IsExist(err) {
+		return err
+	}
+
+	for _, entry := range entries {
+		src := filepath.Join(source, entry.Name())
+		tgt := filepath.Join(target, entry.Name())
+
+		fileInfo, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("failed to get file info for %s: %w", entry.Name(), err)
+		}
+
+		switch {
+		case entry.IsDir():
+			if err := copyDir(tgt, src); err != nil {
+				return err
+			}
+		case (fileInfo.Mode() & os.ModeType) == 0:
+			if err := copyFile(tgt, src); err != nil {
+				return err
+			}
+		default:
+			logrus.Warnf("Skipping file with unsupported mode: %s: %s", src, fileInfo.Mode())
+		}
+	}
+	return nil
+}
+
+// copyFile copies the the source file to the target, creating or truncating it as necessary.
+func copyFile(target, source string) error {
+	src, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("failed to open source %s: %w", source, err)
+	}
+	defer src.Close()
+
+	tgt, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open target %s: %w", target, err)
+	}
+	defer tgt.Close()
+
+	_, err = io.Copy(tgt, src)
+	return err
+}
+
 // setChartValues scans the directory at manifestDir. It attempts to load all manifests
 // in that directory as HelmCharts. Any manifests that contain a HelmChart are modified to
 // pass through settings to both the Helm job and the chart values.
 // NOTE: This will probably fail if any manifest contains multiple documents. This should
 // not matter for any of our packaged components, but may prevent this from working on user manifests.
-func setChartValues(manifestsDir string, nodeConfig *daemonconfig.Node, cfg cmds.Agent) error {
-	serializer := json.NewSerializerWithOptions(json.DefaultMetaFactory, schemes.All, schemes.All, json.SerializerOptions{Yaml: true, Pretty: true, Strict: true})
+func setChartValues(manifestsDir, ingressController string, nodeConfig *daemonconfig.Node, cfg cmds.Agent) error {
 	chartValues := map[string]string{
 		"global.clusterCIDR":                  util.JoinIPNets(nodeConfig.AgentConfig.ClusterCIDRs),
 		"global.clusterCIDRv4":                util.JoinIP4Nets(nodeConfig.AgentConfig.ClusterCIDRs),
@@ -262,6 +318,7 @@ func setChartValues(manifestsDir string, nodeConfig *daemonconfig.Node, cfg cmds
 		"global.clusterDomain":                nodeConfig.AgentConfig.ClusterDomain,
 		"global.rke2DataDir":                  cfg.DataDir,
 		"global.serviceCIDR":                  util.JoinIPNets(nodeConfig.AgentConfig.ServiceCIDRs),
+		"global.systemDefaultIngressClass":    ingressController,
 		"global.systemDefaultRegistry":        nodeConfig.AgentConfig.SystemDefaultRegistry,
 		"global.cattle.systemDefaultRegistry": nodeConfig.AgentConfig.SystemDefaultRegistry,
 	}
@@ -287,7 +344,7 @@ func setChartValues(manifestsDir string, nodeConfig *daemonconfig.Node, cfg cmds
 
 	var errs []error
 	for fileName, info := range files {
-		if err := rewriteChart(fileName, info, chartValues, serializer); err != nil {
+		if err := rewriteChart(fileName, info, chartValues); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -295,69 +352,107 @@ func setChartValues(manifestsDir string, nodeConfig *daemonconfig.Node, cfg cmds
 }
 
 // rewriteChart applies cluster configuration values to the file at fileName with associated info.
-// If the file cannot be decoded as a HelmChart, it is silently skipped. Any other IO error is considered
-// a failure.
-func rewriteChart(fileName string, info os.FileInfo, chartValues map[string]string, serializer *json.Serializer) error {
-	b, err := ioutil.ReadFile(fileName)
+func rewriteChart(fileName string, info os.FileInfo, chartValues map[string]string) error {
+	fh, err := os.OpenFile(fileName, os.O_RDWR, info.Mode())
 	if err != nil {
-		return errors.Wrapf(err, "Failed to read manifest %s", fileName)
+		return errors.Wrapf(err, "failed to open manifest %s", fileName)
 	}
+	defer fh.Close()
 
 	// Ignore manifest if it cannot be decoded
-	obj, _, err := serializer.Decode(b, nil, nil)
+	objs, err := yaml.ToObjects(fh)
 	if err != nil {
-		logrus.Debugf("Failed to decode manifest %s: %s", fileName, err)
+		logrus.Warnf("Failed to decode manifest %s: %s", fileName, err)
 		return nil
-	}
-
-	// Ignore manifest if it is not a HelmChart
-	chart, ok := obj.(*helmv1.HelmChart)
-	if !ok {
-		logrus.Debugf("Manifest %s is %T, not HelmChart", fileName, obj)
-		return nil
-	}
-
-	// Generally we should avoid using Set on HelmCharts since it cannot be overridden by HelmChartConfig,
-	// but in this case we need to do it in order to avoid potentially mangling the ValuesContent field by
-	// blindly appending content to it in order to set values.
-	if chart.Spec.Set == nil {
-		chart.Spec.Set = map[string]intstr.IntOrString{}
 	}
 
 	var changed bool
-	for k, v := range chartValues {
-		val := intstr.FromString(v)
-		if cur, ok := chart.Spec.Set[k]; ok {
-			curBytes, _ := cur.MarshalJSON()
-			newBytes, _ := val.MarshalJSON()
-			if bytes.Equal(curBytes, newBytes) {
-				continue
+
+OBJECTS:
+	for _, obj := range objs {
+		// Manipulate the HelmChart using Unstructured to avoid dropping unknown fields when rewriting the content.
+		// Ref: https://github.com/rancher/rke2/issues/527
+		unst, ok := obj.(*unstructured.Unstructured)
+
+		// Ignore object if it is not a HelmChart
+		if !ok || unst.GroupVersionKind() != helmChartGVK {
+			continue
+		}
+
+		// Ignore object if injection is disabled via annotation or default setting
+		if !isInjectEnabled(unst) {
+			continue
+		}
+
+		var contentChanged bool
+		content := unst.UnstructuredContent()
+
+		// Generally we should avoid using Set on HelmCharts since it cannot be overridden by HelmChartConfig,
+		// but in this case we need to do it in order to avoid potentially mangling the ValuesContent YAML by
+		// blindly appending content to it in order to set values.
+		for k, v := range chartValues {
+			cv, _, err := unstructured.NestedString(content, "spec", "set", k)
+			if err != nil {
+				logrus.Warnf("Failed to get current value from %s/%s in %s: %v", unst.GetNamespace(), unst.GetName(), fileName, err)
+				continue OBJECTS
+			}
+			if cv != v {
+				if err := unstructured.SetNestedField(content, v, "spec", "set", k); err != nil {
+					logrus.Warnf("Failed to write chart value to %s/%s in %s: %v", unst.GetNamespace(), unst.GetName(), fileName, err)
+					continue OBJECTS
+				}
+				contentChanged = true
 			}
 		}
-		changed = true
-		chart.Spec.Set[k] = val
+
+		if contentChanged {
+			changed = true
+			unst.SetUnstructuredContent(content)
+		}
 	}
 
 	if !changed {
-		logrus.Infof("No cluster configuration value changes necessary for HelmChart %s", fileName)
+		logrus.Infof("No cluster configuration value changes necessary for manifest %s", fileName)
 		return nil
 	}
 
-	var buf bytes.Buffer
-	if err := serializer.Encode(chart, &buf); err != nil {
-		return errors.Wrapf(err, "Failed to serialize modified HelmChart %s", fileName)
-	}
-
-	f, err := os.OpenFile(fileName, os.O_RDWR|os.O_TRUNC, info.Mode())
+	data, err := yaml.Export(objs...)
 	if err != nil {
-		return errors.Wrapf(err, "Unable to open HelmChart %s", fileName)
-	}
-	defer f.Close()
-
-	if _, err := io.Copy(f, &buf); err != nil {
-		return errors.Wrapf(err, "Failed to write modified HelmChart %s", fileName)
+		return errors.Wrapf(err, "failed to export modified manifest %s", fileName)
 	}
 
-	logrus.Infof("Updated HelmChart %s to set cluster configuration values", fileName)
+	if _, err := fh.Seek(0, 0); err != nil {
+		return errors.Wrapf(err, "failed to seek in manifest %s", fileName)
+	}
+
+	if err := fh.Truncate(0); err != nil {
+		return errors.Wrapf(err, "failed to truncate manifest %s", fileName)
+	}
+
+	if _, err := fh.Write(data); err != nil {
+		return errors.Wrapf(err, "failed to write modified manifest %s", fileName)
+	}
+
+	if err := fh.Sync(); err != nil {
+		return errors.Wrapf(err, "failed to sync modified manifest %s", fileName)
+	}
+
+	logrus.Infof("Updated manifest %s to set cluster configuration values", fileName)
 	return nil
+}
+
+func isInjectEnabled(obj *unstructured.Unstructured) bool {
+	if v, ok := obj.GetAnnotations()[injectAnnotationKey]; ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return getInjectDefault()
+}
+
+func getInjectDefault() bool {
+	if b, err := strconv.ParseBool(os.Getenv(injectEnvKey)); err == nil {
+		return b
+	}
+	return injectDefault
 }
