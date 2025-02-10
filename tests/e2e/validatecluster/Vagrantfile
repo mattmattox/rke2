@@ -1,13 +1,15 @@
-ENV['VAGRANT_NO_PARALLEL'] = 'no'
+ENV['VAGRANT_NO_PARALLEL'] = ENV['E2E_STANDUP_PARALLEL'] ? nil : 'no'
 NODE_ROLES = (ENV['E2E_NODE_ROLES'] ||
   ["server-0", "server-1", "server-2", "agent-0" ])
 NODE_BOXES = (ENV['E2E_NODE_BOXES'] ||
-  ['generic/ubuntu2004', 'generic/ubuntu2004', 'generic/ubuntu2004', 'generic/ubuntu2004'])
+  ['bento/ubuntu-24.04', 'bento/ubuntu-24.04', 'bento/ubuntu-24.04', 'bento/ubuntu-24.04'])
 GITHUB_BRANCH = (ENV['E2E_GITHUB_BRANCH'] || "master")
 RELEASE_VERSION = (ENV['E2E_RELEASE_VERSION'] || "")
+HARDENED = (ENV['E2E_HARDENED'] || "")
 NODE_CPUS = (ENV['E2E_NODE_CPUS'] || 2).to_i
-NODE_MEMORY = (ENV['E2E_NODE_MEMORY'] || 2048).to_i
+NODE_MEMORY = (ENV['E2E_NODE_MEMORY'] || 3072).to_i
 CNI = (ENV['E2E_CNI'] || "canal") # canal, cilium and calico supported
+REGISTRY = (ENV['E2E_REGISTRY'] || "")
 # Virtualbox >= 6.1.28 require `/etc/vbox/network.conf` for expanded private networks,
 # see https://www.virtualbox.org/manual/ch06.html#network_hostonly
 NETWORK_PREFIX = "10.10.10"
@@ -19,14 +21,22 @@ def provision(vm, roles, role_num, node_num)
   node_ip = "#{NETWORK_PREFIX}.#{100+node_num}"
   vm.network "private_network", ip: node_ip, netmask: "255.255.255.0"
 
-  vagrant_defaults = File.exists?("./vagrantdefaults.rb") ? "./vagrantdefaults.rb" : "../vagrantdefaults.rb"
+  scripts_location = Dir.exist?("./scripts") ? "./scripts" : "../scripts" 
+  vagrant_defaults = File.exist?("./vagrantdefaults.rb") ? "./vagrantdefaults.rb" : "../vagrantdefaults.rb"
   load vagrant_defaults
   
   defaultOSConfigure(vm)
+  if !HARDENED.empty? 
+    cisPrep(vm)
+  end
   install_type = getInstallType(vm, RELEASE_VERSION, GITHUB_BRANCH)
   
   vm.provision "shell", inline: "ping -c 2 rke2.io"
   
+  if !REGISTRY.empty?
+    vm.provision "Set private registry", type: "shell", path: scripts_location + "/registry.sh", args: [ "#{NETWORK_PREFIX}.1" ]
+  end
+
   if roles.include?("server") && role_num == 0
     vm.provision :rke2, run: 'once' do |rke2|
       rke2.env = %W[INSTALL_RKE2_TYPE=server #{install_type}]
@@ -88,10 +98,7 @@ Vagrant.configure("2") do |config|
     NODE_BOXES = NODE_BOXES.split(" ", -1)
   end
 
-  # Must iterate on the index, vagrant does not understand iterating 
-  # over the node roles themselves
-  NODE_ROLES.length.times do |i|
-    name = NODE_ROLES[i]
+  NODE_ROLES.each_with_index do |name, i|
     config.vm.define name do |node|
       roles = name.split("-", -1)
       role_num = roles.pop.to_i

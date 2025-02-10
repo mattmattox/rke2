@@ -1,4 +1,4 @@
-package validatecluster
+package splitserver
 
 import (
 	"flag"
@@ -13,11 +13,12 @@ import (
 	"github.com/rancher/rke2/tests/e2e"
 )
 
-// Valid nodeOS: generic/ubuntu2004, opensuse/Leap-15.3.x86_64
-var nodeOS = flag.String("nodeOS", "generic/ubuntu2004", "VM operating system")
+// Valid nodeOS: bento/ubuntu-24.04, opensuse/Leap-15.6.x86_64
+var nodeOS = flag.String("nodeOS", "bento/ubuntu-24.04", "VM operating system")
 var etcdCount = flag.Int("etcdCount", 1, "number of server nodes only deploying etcd")
 var controlPlaneCount = flag.Int("controlPlaneCount", 1, "number of server nodes acting as control plane")
 var agentCount = flag.Int("agentCount", 1, "number of agent nodes")
+var ci = flag.Bool("ci", false, "running on CI")
 
 // Environment Variables Info:
 // E2E_RELEASE_VERSION=v1.23.1+rke2r1 or nil for latest commit from master
@@ -48,7 +49,7 @@ func createSplitCluster(nodeOS string, etcdCount, controlPlaneCount, agentCount 
 		}
 	}
 
-	cmd := fmt.Sprintf(`E2E_NODE_ROLES="%s" E2E_NODE_BOXES="%s" %s vagrant up &> vagrant.log`, nodeRoles, nodeBoxes, testOptions)
+	cmd := fmt.Sprintf(`E2E_NODE_ROLES="%s" E2E_NODE_BOXES="%s" %s vagrant up --no-tty &> vagrant.log`, nodeRoles, nodeBoxes, testOptions)
 	fmt.Println(cmd)
 	if _, err := e2e.RunCommand(cmd); err != nil {
 		fmt.Println("Error Creating Cluster", err)
@@ -59,7 +60,8 @@ func createSplitCluster(nodeOS string, etcdCount, controlPlaneCount, agentCount 
 func Test_E2ESplitServer(t *testing.T) {
 	RegisterFailHandler(Fail)
 	flag.Parse()
-	RunSpecs(t, "Split Server Test Suite")
+	suiteConfig, reporterConfig := GinkgoConfiguration()
+	RunSpecs(t, "Split Server Test Suite", suiteConfig, reporterConfig)
 }
 
 var (
@@ -68,13 +70,13 @@ var (
 	cpNodeNames    []string
 	agentNodeNames []string
 )
-
-var _ = Describe("Verify Create", func() {
+var _ = ReportAfterEach(e2e.GenReport)
+var _ = Describe("Verify Create", Ordered, func() {
 	Context("Cluster :", func() {
 		It("Starts up with no issues", func() {
 			var err error
 			etcdNodeNames, cpNodeNames, agentNodeNames, err = createSplitCluster(*nodeOS, *etcdCount, *controlPlaneCount, *agentCount)
-			Expect(err).NotTo(HaveOccurred(), e2e.GetVagrantLog())
+			Expect(err).NotTo(HaveOccurred(), e2e.GetVagrantLog(err))
 			fmt.Println("CLUSTER CONFIG")
 			fmt.Println("OS:", *nodeOS)
 			fmt.Println("Etcd Server Nodes:", etcdNodeNames)
@@ -203,11 +205,11 @@ var _ = Describe("Verify Create", func() {
 
 var failed = false
 var _ = AfterEach(func() {
-	failed = failed || CurrentGinkgoTestDescription().Failed
+	failed = failed || CurrentSpecReport().Failed()
 })
 
 var _ = AfterSuite(func() {
-	if failed {
+	if failed && !*ci {
 		fmt.Println("FAILED!")
 	} else {
 		Expect(e2e.DestroyCluster()).To(Succeed())

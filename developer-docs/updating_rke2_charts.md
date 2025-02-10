@@ -19,8 +19,8 @@ the controllers part of `rke2 server` binary.
 
 ## How to update a chart?
 
-Before going into updating the chart, note a chart update normally means updating the images that this chart is consumin
-g. In general, rke2 is consuming hardened images that are built using a FIPS compliant process. In other words, **do not
+Before going into updating the chart, note a chart update normally means updating the images that this chart is consuming.
+In general, rke2 is consuming hardened images that are built using a FIPS compliant process. In other words, **do not
  use the upstream images**. Instead, refer to the Github project building that image and use the code of the upstream
 project to yield a hardened image. The Github projects building hardened images are under our [github rancher](https://github.com/rancher/)
 and start with the name `image-build-`, for example: [image-build-coredns](https://github.com/rancher/image-build-coredns).
@@ -80,7 +80,7 @@ xargs -n1 -t docker image pull --quiet << EOF >> build/images-core.txt
     ${REGISTRY}/rancher/hardened-etcd:${ETCD_VERSION}-build20220413
     ${REGISTRY}/rancher/hardened-k8s-metrics-server:v0.5.0-build20210915
     ${REGISTRY}/rancher/klipper-helm:v0.6.1-build20210616
-    ${REGISTRY}/rancher/pause:${PAUSE_VERSION}
+    ${REGISTRY}/rancher/mirrored-pause:${PAUSE_VERSION}
     ${REGISTRY}/rancher/mirrored-jettech-kube-webhook-certgen:v1.5.1
     ${REGISTRY}/rancher/nginx-ingress-controller:nginx-0.47.0-hardened1
     ${REGISTRY}/rancher/rke2-cloud-provider:${CCM_VERSION}

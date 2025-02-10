@@ -6,66 +6,71 @@ package windows
 import (
 	"context"
 
-	"github.com/k3s-io/k3s/pkg/daemons/config"
 	daemonconfig "github.com/k3s-io/k3s/pkg/daemons/config"
+	opv1 "github.com/tigera/operator/api/v1"
 	"k8s.io/client-go/rest"
 )
 
-type CNI interface {
-	Setup(context.Context, string, *daemonconfig.Node, *rest.Config) (*CNIConfig, error)
-	Start(context.Context, *CNIConfig) error
+type CNIPlugin interface {
+	Setup(ctx context.Context, nodeConfig *daemonconfig.Node, restConfig *rest.Config, dataDir string) error
+	Start(ctx context.Context) error
+	GetConfig() *CNICommonConfig
+	ReserveSourceVip(ctx context.Context) (string, error)
 }
 
-type CNIConfig struct {
-	NodeConfig   *config.Node
-	CalicoConfig *CalicoConfig
-	NetworkName  string
-	BindAddress  string
+type KubeConfig struct {
+	CertificateAuthority string
+	Server               string
+	Token                string
+	Path                 string
 }
 
-type FelixConfig struct {
-	Metadataaddr    string
-	Vxlanvni        string
-	MacPrefix       string
-	LogSeverityFile string
-	LogSeveritySys  string
-}
-
-type CalicoCNIConfig struct {
-	BinDir       string
-	ConfDir      string
-	IpamType     string
-	ConfFileName string
-	Version      string
+type CNICommonConfig struct {
+	Name           string
+	OverlayNetName string
+	OverlayEncap   string
+	Hostname       string
+	ConfigPath     string
+	CNIConfDir     string
+	CNIBinDir      string
+	ClusterCIDR    string
+	ServiceCIDR    string
+	NodeIP         string
+	VxlanVNI       string
+	VxlanPort      string
+	Interface      string
+	IpamType       string
+	CNIVersion     string
+	KubeConfig     *KubeConfig
 }
 
 type CalicoConfig struct {
-	Name                  string
-	Mode                  string
-	Hostname              string
+	CNICommonConfig       // embedded struct
 	KubeNetwork           string
-	NetworkingBackend     string
-	ServiceCIDR           string
 	DNSServers            string
 	DNSSearch             string
 	DatastoreType         string
 	NodeNameFile          string
 	Platform              string
-	StartUpValidIPTimeout int
-	IP                    string
-	LogDir                string
-	Felix                 FelixConfig
-	CNI                   CalicoCNIConfig
+	IPAutoDetectionMethod string
 	ETCDEndpoints         string
 	ETCDKeyFile           string
 	ETCDCertFile          string
 	ETCDCaCertFile        string
-	KubeConfig            CalicoKubeConfig
 }
 
-type CalicoKubeConfig struct {
-	CertificateAuthority string
-	Server               string
-	Token                string
-	Path                 string
+type FlannelConfig struct {
+	CNICommonConfig // embedded struct
+}
+
+// Stub of Calico configuration used to extract user-provided overrides
+// Based off of https://github.com/tigera/operator/blob/master/api/v1/installation_types.go
+type CalicoInstallation struct {
+	Installation CalicoInstallationSpec `json:"installation,omitempty"`
+}
+
+type CalicoInstallationSpec struct {
+	CalicoNetwork            opv1.CalicoNetworkSpec `json:"calicoNetwork,omitempty"`
+	FlexVolumePath           string                 `json:"flexVolumePath,omitempty"`
+	ControlPlaneNodeSelector map[string]string      `json:"controlPlaneNodeSelector,omitempty"`
 }

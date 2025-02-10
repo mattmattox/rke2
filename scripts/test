@@ -1,31 +1,28 @@
 #!/bin/bash
+
 set -e -x
 cd $(dirname $0)/..
 
 docker ps
 
-. ./scripts/test-helpers
+. ./tests/docker/test-helpers
 
 artifacts=$(pwd)/dist/artifacts
 mkdir -p $artifacts
 
 # ---
 
-. ./scripts/test-run-basics
+. ./tests/docker/test-run-basics
 echo "Did test-run-basics $?"
 
 # ---
 
-[ "$ARCH" != 'amd64' ] && \
-  early-exit "Skipping remaining tests, images not available for $ARCH."
+if [ "$ARCH" != 'amd64' ]; then
+    early-exit "Skipping remaining tests, images not available for $ARCH."
+fi
 
 E2E_OUTPUT=$artifacts test-run-sonobuoy
 echo "Did test-run-sonobuoy $?"
-# ---
-
-[ "$DRONE_BUILD_EVENT" = 'tag' ] && \
-  early-exit 'Skipping remaining tests on tag.'
-
 # ---
 
 #test-run-sonobuoy mysql

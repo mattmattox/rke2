@@ -9,47 +9,56 @@ import (
 )
 
 var (
-	k3sAgentBase = mustCmdFromK3S(cmds.NewAgentCommand(AgentRun), map[string]*K3SFlagOption{
-		"config":          copy,
-		"debug":           copy,
-		"v":               hide,
-		"vmodule":         hide,
-		"log":             hide,
-		"alsologtostderr": hide,
+	k3sAgentBase = mustCmdFromK3S(cmds.NewAgentCommand(AgentRun), K3SFlagSet{
+		"config":          copyFlag,
+		"debug":           copyFlag,
+		"v":               hideFlag,
+		"vmodule":         hideFlag,
+		"log":             hideFlag,
+		"alsologtostderr": hideFlag,
 		"data-dir": {
 			Usage:   "(data) Folder to hold state",
 			Default: rke2Path,
 		},
-		"token":                             copy,
-		"token-file":                        copy,
-		"disable-selinux":                   drop,
-		"node-name":                         copy,
-		"with-node-id":                      drop,
-		"node-label":                        copy,
-		"node-taint":                        copy,
-		"image-credential-provider-bin-dir": copy,
-		"image-credential-provider-config":  copy,
-		"docker":                            drop,
-		"container-runtime-endpoint":        copy,
-		"pause-image":                       drop,
-		"private-registry":                  copy,
-		"node-ip":                           copy,
-		"node-external-ip":                  copy,
-		"resolv-conf":                       copy,
-		"flannel-iface":                     drop,
-		"flannel-conf":                      drop,
-		"flannel-cni-conf":                  drop,
-		"kubelet-arg":                       copy,
-		"kube-proxy-arg":                    copy,
-		"rootless":                          drop,
-		"server":                            copy,
-		"no-flannel":                        drop,
-		"cluster-secret":                    drop,
-		"protect-kernel-defaults":           copy,
-		"snapshotter":                       copy,
-		"selinux":                           copy,
-		"lb-server-port":                    copy,
-		"airgap-extra-registry":             copy,
+		"token":                             copyFlag,
+		"token-file":                        copyFlag,
+		"node-name":                         copyFlag,
+		"with-node-id":                      copyFlag,
+		"node-label":                        copyFlag,
+		"node-taint":                        copyFlag,
+		"image-credential-provider-bin-dir": copyFlag,
+		"image-credential-provider-config":  copyFlag,
+		"docker":                            dropFlag,
+		"container-runtime-endpoint":        copyFlag,
+		"disable-default-registry-endpoint": copyFlag,
+		"nonroot-devices":                   copyFlag,
+		"image-service-endpoint":            dropFlag,
+		"pause-image":                       dropFlag,
+		"default-runtime":                   copyFlag,
+		"disable-apiserver-lb":              dropFlag,
+		"private-registry":                  copyFlag,
+		"node-ip":                           copyFlag,
+		"node-external-ip":                  copyFlag,
+		"node-internal-dns":                 copyFlag,
+		"node-external-dns":                 copyFlag,
+		"resolv-conf":                       copyFlag,
+		"flannel-iface":                     dropFlag,
+		"flannel-conf":                      dropFlag,
+		"flannel-cni-conf":                  dropFlag,
+		"vpn-auth":                          dropFlag,
+		"vpn-auth-file":                     dropFlag,
+		"kubelet-arg":                       copyFlag,
+		"kube-proxy-arg":                    copyFlag,
+		"rootless":                          dropFlag,
+		"prefer-bundled-bin":                dropFlag,
+		"server":                            copyFlag,
+		"protect-kernel-defaults":           copyFlag,
+		"snapshotter":                       copyFlag,
+		"selinux":                           copyFlag,
+		"lb-server-port":                    copyFlag,
+		"airgap-extra-registry":             copyFlag,
+		"bind-address":                      copyFlag,
+		"enable-pprof":                      copyFlag,
 	})
 	deprecatedFlags = []cli.Flag{
 		&cli.StringFlag{
@@ -84,8 +93,15 @@ func agentSubcommands() cli.Commands {
 func AgentRun(clx *cli.Context) error {
 	validateCloudProviderName(clx, Agent)
 	validateProfile(clx, Agent)
-	if err := windows.StartService(); err != nil {
+	isWinService, err := windows.StartService()
+	if err != nil {
 		return err
 	}
-	return rke2.Agent(clx, config)
+
+	err = rke2.Agent(clx, config)
+	if isWinService {
+		windows.MonitorProcessExit()
+	}
+
+	return err
 }
