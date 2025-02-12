@@ -1,0 +1,273 @@
+on:
+  push:
+    paths-ignore:
+      - "**.md"
+      - "channel.yaml"
+      - "install.sh"
+      - "!.github/workflows/test-suite.yaml"
+    tags:
+    - "v*"
+
+env:
+  GITHUB_ACTION_TAG: ${{ github.ref_name }}
+  GH_TOKEN: ${{ github.token }}
+  
+name: Release
+permissions:
+    contents: write
+    id-token: write
+jobs:
+  release-amd64:
+    runs-on: runs-on,runner=8cpu-linux-x64,run-id=${{ github.run_id }},image=ubuntu22-full-x64,hdd=256
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Dapper
+      run: |
+        curl -sL https://releases.rancher.com/dapper/latest/dapper-$(uname -s)-$(uname -m) > /usr/local/bin/dapper
+        chmod +x /usr/local/bin/dapper
+
+    - name: Validate Release
+      run: |
+       dapper -f Dockerfile --target dapper make validate-release
+
+    - name: Build
+      run: |
+        dapper -f Dockerfile --target dapper make dapper-ci
+    
+    - name: "Read secrets"
+      uses: rancher-eio/read-vault-secrets@main
+      with:
+        secrets: |
+          secret/data/github/repo/${{ github.repository }}/dockerhub/${{ github.repository_owner }}/credentials username | DOCKER_USERNAME ;
+          secret/data/github/repo/${{ github.repository }}/dockerhub/${{ github.repository_owner }}/credentials password | DOCKER_PASSWORD ;
+          secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials registry | PRIME_REGISTRY ;
+          secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials username | PRIME_REGISTRY_USERNAME ;
+          secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials password | PRIME_REGISTRY_PASSWORD
+
+    - name: Package Images
+      run: |
+        dapper -f Dockerfile --target dapper make package-images
+    
+    - name: Scan Images
+      continue-on-error: true
+      # This is a temporary workaround until the base image is updated
+      # in the Dockerfile to include the new trivy version that supports VEX
+      run: |
+        docker run --rm -v "$(pwd)/build:/build" -v "$(pwd):/workspace" \
+          -w /workspace rancher/hardened-build-base:v1.23.3b1 \
+          make scan-images
+    - name: Upload Scan Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-trivy-scan
+        path: trivy_scan_report.txt
+        
+    - name: Test
+      run: |
+        dapper -f Dockerfile --target dapper make test
+
+    - name: Publish Image Runtime
+      uses: rancher/ecm-distro-tools/actions/publish-image@master
+      env:
+        GOARCH: amd64
+        GOOS: linux
+      with:
+        image: "rke2-runtime"
+        tag: ${{ github.ref_name }}
+        make-target: publish-image-runtime
+
+        public-repo: rancher
+        public-username: ${{ env.DOCKER_USERNAME }}
+        public-password: ${{ env.DOCKER_PASSWORD }}
+
+        prime-repo: rancher
+        prime-registry: ${{ env.PRIME_REGISTRY }}
+        prime-username: ${{ env.PRIME_REGISTRY_USERNAME }}
+        prime-password: ${{ env.PRIME_REGISTRY_PASSWORD }}
+
+    - name: Publish Image Runtime (Windows)
+      uses: rancher/ecm-distro-tools/actions/publish-image@master
+      env:
+        GOARCH: amd64
+        GOOS: linux
+      with:
+        image: "rke2-runtime"
+        tag: ${{ github.ref_name }}
+        make-target: publish-image-runtime-windows
+
+        public-repo: rancher
+        public-username: ${{ env.DOCKER_USERNAME }}
+        public-password: ${{ env.DOCKER_PASSWORD }}
+
+        prime-repo: rancher
+        prime-registry: ${{ env.PRIME_REGISTRY }}
+        prime-username: ${{ env.PRIME_REGISTRY_USERNAME }}
+        prime-password: ${{ env.PRIME_REGISTRY_PASSWORD }}
+  
+    - name: Package windows images
+      run: |
+        GITHUB_ACTION_TAG=${{ github.ref_name }} dapper -f Dockerfile --target dapper make package-windows-images
+
+    - name: Checksum Artifacts
+      run: |
+        GITHUB_ACTION_TAG=${{ github.ref_name }} dapper -f Dockerfile --target dapper make checksum
+
+    - name: Publish Artifacts
+      run: |
+        dapper -f Dockerfile --target dapper make publish-binary
+      env:
+        GH_TOKEN: ${{ github.token }}
+  release-arm64:
+    runs-on: runs-on,runner=8cpu-linux-arm64,run-id=${{ github.run_id }},image=ubuntu22-full-arm64,hdd=256
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Dapper
+      run: |
+        curl -sL https://releases.rancher.com/dapper/latest/dapper-$(uname -s)-$(uname -m) > /usr/local/bin/dapper
+        chmod +x /usr/local/bin/dapper
+
+    - name: Validate Release
+      run: |
+       dapper -f Dockerfile --target dapper make validate-release
+
+    - name: Build
+      run: |
+        dapper -f Dockerfile --target dapper make dapper-ci
+    
+    - name: "Read secrets"
+      uses: rancher-eio/read-vault-secrets@main
+      with:
+        secrets: |
+          secret/data/github/repo/${{ github.repository }}/dockerhub/${{ github.repository_owner }}/credentials username | DOCKER_USERNAME ;
+          secret/data/github/repo/${{ github.repository }}/dockerhub/${{ github.repository_owner }}/credentials password | DOCKER_PASSWORD ;
+          secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials registry | PRIME_REGISTRY ;
+          secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials username | PRIME_REGISTRY_USERNAME ;
+          secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials password | PRIME_REGISTRY_PASSWORD ;
+
+    - name: Package Images
+      run: |
+        dapper -f Dockerfile --target dapper make package-images
+    
+    - name: Scan Images
+      continue-on-error: true
+      run: |
+        dapper -f Dockerfile --target dapper make scan-images
+
+    - name: Publish Image Runtime
+      uses: rancher/ecm-distro-tools/actions/publish-image@master
+      env:
+        GOARCH: arm64
+        GOOS: linux
+      with:
+        image: "rke2-runtime"
+        tag: ${{ github.ref_name }}
+        make-target: publish-image-runtime
+
+        public-repo: rancher
+        public-username: ${{ env.DOCKER_USERNAME }}
+        public-password: ${{ env.DOCKER_PASSWORD }}
+
+        prime-repo: rancher
+        prime-registry: ${{ env.PRIME_REGISTRY }}
+        prime-username: ${{ env.PRIME_REGISTRY_USERNAME }}
+        prime-password: ${{ env.PRIME_REGISTRY_PASSWORD }}
+
+    - name: Checksum
+      run: |
+        GITHUB_ACTION_TAG=${{ github.ref_name }} dapper -f Dockerfile --target dapper make checksum
+
+    - name: Publish Artifacts
+      run: |
+        dapper -f Dockerfile --target dapper make publish-binary
+      env:
+        GH_TOKEN: ${{ github.token }}
+  manifest:
+    needs: [release-amd64, release-arm64]
+    runs-on: runs-on,runner=8cpu-linux-x64,run-id=${{ github.run_id }},image=ubuntu22-full-x64,hdd=64
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Dapper
+      run: |
+        curl -sL https://releases.rancher.com/dapper/latest/dapper-$(uname -s)-$(uname -m) > /usr/local/bin/dapper
+        chmod +x /usr/local/bin/dapper
+
+    - name: "Read secrets"
+      uses: rancher-eio/read-vault-secrets@main
+      with:
+        secrets: |
+          secret/data/github/repo/${{ github.repository }}/dockerhub/${{ github.repository_owner }}/credentials username | DOCKER_USERNAME ;
+          secret/data/github/repo/${{ github.repository }}/dockerhub/${{ github.repository_owner }}/credentials password | DOCKER_PASSWORD ;
+          secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials registry | PRIME_REGISTRY ;
+          secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials username | PRIME_REGISTRY_USERNAME ;
+          secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials password | PRIME_REGISTRY_PASSWORD ;
+
+    - name: Manifest
+      uses: rancher/ecm-distro-tools/actions/publish-image@master
+      env:
+        GOARCH: amd64
+        GOOS: linux
+      with:
+        image: "rke2-runtime"
+        tag: ${{ github.ref_name }}
+        make-target: publish-manifest-runtime
+
+        public-repo: rancher
+        public-username: ${{ env.DOCKER_USERNAME }}
+        public-password: ${{ env.DOCKER_PASSWORD }}
+
+        prime-repo: rancher
+        prime-registry: ${{ env.PRIME_REGISTRY }}
+        prime-username: ${{ env.PRIME_REGISTRY_USERNAME }}
+        prime-password: ${{ env.PRIME_REGISTRY_PASSWORD }}
+
+  release-downstream-components:
+    name: "Release downstream components"
+    needs: [release-amd64, release-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: "Read Secrets"
+      uses: rancher-eio/read-vault-secrets@main
+      with:
+        secrets: |
+          secret/data/github/repo/${{ github.repository }}/github/app-credentials appId | APP_ID ;
+          secret/data/github/repo/${{ github.repository }}/github/app-credentials privateKey | PRIVATE_KEY
+
+    - name: Generate GitHub App token
+      id: generate-token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ env.APP_ID }}
+        private-key: ${{ env.PRIVATE_KEY }}
+        owner: rancher
+        repositories: |
+          rke2-upgrade
+          system-agent-installer-rke2
+
+    - name: Create release in `rancher/rke2-upgrade`
+      env:
+        GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+      run: |
+        gh release create "$GITHUB_ACTION_TAG" \
+          --repo rancher/rke2-upgrade \
+          --title "$GITHUB_ACTION_TAG" \
+          --latest="false" \
+          --notes "Automated release created from $GITHUB_ACTION_TAG tag in ${{ github.repository }}"
+
+    - name: Create release in `rancher/system-agent-installer-rke2`
+      env:
+        GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+      run: |
+        gh release create "$GITHUB_ACTION_TAG" \
+          --repo rancher/system-agent-installer-rke2 \
+          --title "$GITHUB_ACTION_TAG" \
+          --latest="false" \
+          --notes "Automated release created from $GITHUB_ACTION_TAG tag in ${{ github.repository }}"

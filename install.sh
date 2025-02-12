@@ -16,7 +16,7 @@ fi
 #
 #   - INSTALL_RKE2_CHANNEL
 #     Channel to use for fetching rke2 download URL.
-#     Defaults to 'latest'.
+#     Defaults to 'stable'.
 #
 #   - INSTALL_RKE2_METHOD
 #     The installation method to use.
@@ -55,6 +55,14 @@ fi
 #     rather than the downloading the files from the internet.
 #     Default is not set.
 #
+#   - INSTALL_RKE2_SKIP_RELOAD
+#     If set, the install script will skip reloading systemctl daemon after the tar has been extracted and systemd units
+#     have been moved.
+#     Default is not set.
+#
+#   - INSTALL_RKE2_SKIP_FAPOLICY
+#     If set, the install script will skip adding fapolicy rules
+#     Default is not set.
 
 
 # info logs the given argument at info log level.
@@ -90,7 +98,7 @@ check_target_ro() {
 
 # setup_env defines needed environment variables.
 setup_env() {
-    STORAGE_URL="https://storage.googleapis.com/rke2-ci-builds"
+    STORAGE_URL="https://rke2-ci-builds.s3.amazonaws.com"
     INSTALL_RKE2_GITHUB_URL="https://github.com/rancher/rke2"
     DEFAULT_TAR_PREFIX="/usr/local"
     # --- bail if we are not root ---
@@ -153,12 +161,12 @@ check_method_conflict() {
 # fatal if architecture not supported.
 setup_arch() {
     case ${ARCH:=$(uname -m)} in
-    amd64)
+    x86_64|amd64)
         ARCH=amd64
         SUFFIX=$(uname -s | tr '[:upper:]' '[:lower:]')-${ARCH}
         ;;
-    x86_64)
-        ARCH=amd64
+    aarch64|arm64)
+        ARCH=arm64
         SUFFIX=$(uname -s | tr '[:upper:]' '[:lower:]')-${ARCH}
         ;;
     s390x)
@@ -184,6 +192,22 @@ verify_downloader() {
 
     # Set verified executable as our downloader program and return success
     DOWNLOADER=${cmd}
+    return 0
+}
+
+# verify_fapolicyd verifies existence of
+# fapolicyd and fagenrules executables and make sure that fapolicyd service is running.
+verify_fapolicyd() {
+    cmd="$(command -v "fapolicyd")"
+    if [ -z "${cmd}" ]; then
+        return 1
+    fi
+    cmd="$(command -v "fagenrules")"
+    if [ -z "${cmd}" ]; then
+        return 1
+    fi
+    systemctl is-active --quiet fapolicyd || return 1
+
     return 0
 }
 
@@ -411,16 +435,23 @@ install_airgap_tarball() {
     mkdir -p "${INSTALL_RKE2_AGENT_IMAGES_DIR}"
     # releases that provide zst artifacts can read from the compressed archive; older releases
     # that produce only gzip artifacts need to have the tarball decompressed ahead of time
-    if grep -qF '.tar.zst' "${TMP_AIRGAP_CHECKSUMS}" || [ "${AIRGAP_TARBALL_FORMAT}" = "zst" ]; then
+    if grep -sqF '.tar.zst' "${TMP_AIRGAP_CHECKSUMS}" || [ "${AIRGAP_TARBALL_FORMAT}" = "zst" ]; then
         info "installing airgap tarball to ${INSTALL_RKE2_AGENT_IMAGES_DIR}"
         mv -f "${TMP_AIRGAP_TARBALL}" "${INSTALL_RKE2_AGENT_IMAGES_DIR}/rke2-images.${SUFFIX}.tar.zst"
     else
         info "decompressing airgap tarball to ${INSTALL_RKE2_AGENT_IMAGES_DIR}"
         gzip -dc "${TMP_AIRGAP_TARBALL}" > "${INSTALL_RKE2_AGENT_IMAGES_DIR}/rke2-images.${SUFFIX}.tar"
     fi
+    # Search for and install additional rke2 images
+    for IMAGE in "${INSTALL_RKE2_ARTIFACT_PATH}"/rke2-images-*."${SUFFIX}"*; do 
+        if [ -f "${IMAGE}" ]; then
+            info "Installing airgap image from ${IMAGE}"
+            cp "${IMAGE}" "${INSTALL_RKE2_AGENT_IMAGES_DIR}"
+        fi
+    done
 }
 
-# install_dev_rpm orchestates the installation of RKE2 unsigned development rpms
+# install_dev_rpm orchestrates the installation of RKE2 unsigned development rpms
 install_dev_rpm() {
     rpm_installer="${1:-yum}"
     distro="${2:-centos7}"
@@ -451,16 +482,26 @@ install_dev_rpm() {
 }
 
 # do_install_rpm builds a yum repo config from the channel and version to be installed,
-# and calls yum to install the required packates.
+# and calls yum to install the required packages.
 do_install_rpm() {
     . /etc/os-release
-    if [ -r /etc/redhat-release ] || [ -r /etc/centos-release ] || [ -r /etc/oracle-release ] || [ "${ID_LIKE%%[ ]*}" = "suse"  ]; then
+    if [ -r /etc/redhat-release ] || [ -r /etc/centos-release ] || [ -r /etc/oracle-release ] || [ -r /etc/system-release ] || [ "${ID_LIKE%%[ ]*}" = "suse"  ]; then
         repodir=/etc/yum.repos.d
         if [ -d /etc/zypp/repos.d ]; then
             repodir=/etc/zypp/repos.d
         fi
         if [ "${ID_LIKE%%[ ]*}" = "suse" ]; then
+            # create the /var/lib/rpm-state in SLE systems to fix the prein selinux macro
+            if [ "${TRANSACTIONAL_UPDATE=false}" != "true" ] && [ -x /usr/sbin/transactional-update ]; then
+                transactional_update_run="transactional-update --no-selfupdate -d run"
+            fi
+            ${transactional_update_run} mkdir -p /var/lib/rpm-state
+            # configure infix and rpm_installer
             rpm_site_infix=microos
+            if [ "${VARIANT_ID:-}" = sle-micro ] || [ "${ID:-}" = sle-micro ]; then
+                rpm_site_infix=slemicro
+                package_installer=zypper
+            fi
             rpm_installer="zypper --gpg-auto-import-keys"
             if [ "${TRANSACTIONAL_UPDATE=false}" != "true" ] && [ -x /usr/sbin/transactional-update ]; then
                 rpm_installer="transactional-update --no-selfupdate -d run ${rpm_installer}"
@@ -468,11 +509,14 @@ do_install_rpm() {
         else
             maj_ver=$(echo "$VERSION_ID" | sed -E -e "s/^([0-9]+)\.?[0-9]*$/\1/")
             case ${maj_ver} in
-                7|8)
+                7|8|9)
                     :
                     ;;
-                *) # In certain cases, like installing on Fedora, maj_ver will end up being something that is not 7 or 8
-                    maj_ver="7"
+                2023) # detect amazon linux 2023 distro
+                    maj_ver="8"
+                    ;;
+                *) # set default distro to centos 8, for edge cases such as fedora
+                    maj_ver="8"
                     ;;
             esac
             rpm_site_infix=centos/${maj_ver}
@@ -518,12 +562,22 @@ EOF
     cat <<-EOF >>"${repodir}/rancher-rke2.repo"
 [rancher-rke2-${rke2_majmin}-${rke2_rpm_channel}]
 name=Rancher RKE2 ${rke2_majmin} (${1})
-baseurl=https://${rpm_site}/rke2/${rke2_rpm_channel}/${rke2_majmin}/${rpm_site_infix}/x86_64
+baseurl=https://${rpm_site}/rke2/${rke2_rpm_channel}/${rke2_majmin}/${rpm_site_infix}/$(uname -m)
 enabled=1
 gpgcheck=1
 repo_gpgcheck=0
 gpgkey=https://${rpm_site}/public.key
 EOF
+    fi
+
+    if rpm -q --quiet rke2-selinux; then
+            # remove rke2-selinux module in el9 before upgrade to allow container-selinux to upgrade safely
+            if check_available_upgrades container-selinux && check_available_upgrades rke2-selinux && check_breaking_version container-selinux 2 189; then
+                MODULE_PRIORITY=$(semodule --list=full | grep rke2 | cut -f1 -d" ")
+                if [ -n "${MODULE_PRIORITY}" ]; then
+                    semodule -X $MODULE_PRIORITY -r rke2 || true
+                fi
+            fi
     fi
 
     if [ -z "${INSTALL_RKE2_VERSION}" ] && [ -z "${INSTALL_RKE2_COMMIT}" ]; then
@@ -539,6 +593,35 @@ EOF
             ${rpm_installer} install -y "rke2-${INSTALL_RKE2_TYPE}-${rke2_rpm_version}"
         fi
     fi
+}
+
+check_breaking_version() {
+  maj=$2
+  min=$3
+
+  current_maj=$(rpm -qi $1 | awk -F': ' '/Version/ {print $2}' | sed -E -e "s/^([0-9]+)\.([0-9]+).*/\1/")
+  current_min=$(rpm -qi $1 | awk -F': ' '/Version/ {print $2}' | sed -E -e "s/^([0-9]+)\.([0-9]+).*/\2/")
+
+  if [ "${current_maj}" == "${maj}" ] && [ $current_min -le $min ]; then
+    return 0
+  fi
+
+  return 1
+}
+
+check_available_upgrades() {
+    . /etc/os-release
+    set +e
+    if [ "${ID_LIKE%%[ ]*}" = "suse" ]; then
+        available_upgrades=$(zypper -q -t -s 11 se -s -u --type package $1 | tail -n 1 | grep -v "No matching" | awk '{print $3}')
+    else
+        available_upgrades=$(yum -q --refresh list $1 --upgrades | tail -n 1 | awk '{print $2}')
+    fi
+    set -e
+    if [ -n "${available_upgrades}" ]; then
+        return 0
+    fi
+    return 1
 }
 
 do_install_tar() {
@@ -561,7 +644,27 @@ do_install_tar() {
     install_airgap_tarball
     verify_tarball
     unpack_tarball
-    systemctl daemon-reload
+
+    if [ -z "${INSTALL_RKE2_SKIP_RELOAD}" ]; then
+        systemctl daemon-reload
+    fi
+}
+
+setup_fapolicy_rules() {
+    if [ -r /etc/redhat-release ] || [ -r /etc/centos-release ] || [ -r /etc/oracle-release ] || [ -r /etc/rocky-release ] || [ -r /etc/system-release ]; then
+        verify_fapolicyd || return 0
+        # setting rke2 fapolicyd rules
+        cat <<-EOF >"/etc/fapolicyd/rules.d/80-rke2.rules"
+allow perm=any all : dir=/var/lib/rancher/
+allow perm=any all : dir=/opt/cni/
+allow perm=any all : dir=/run/k3s/
+allow perm=any all : dir=/var/lib/kubelet/
+EOF
+        if [ -z "${INSTALL_RKE2_SKIP_RELOAD}" ]; then
+            fagenrules --load || fatal "failed to load rke2 fapolicyd rules"
+            systemctl restart fapolicyd
+        fi
+    fi
 }
 
 do_install() {
@@ -580,6 +683,9 @@ do_install() {
         do_install_tar "${INSTALL_RKE2_CHANNEL}"
         ;;
     esac
+    if [ -z "${INSTALL_RKE2_SKIP_FAPOLICY}" ]; then
+        setup_fapolicy_rules
+    fi
 }
 
 do_install

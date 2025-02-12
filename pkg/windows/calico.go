@@ -5,38 +5,121 @@ package windows
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
+	"text/template"
 	"time"
 
 	"github.com/Microsoft/hcsshim"
-	wapi "github.com/iamacarpet/go-win64api"
 	"github.com/k3s-io/helm-controller/pkg/generated/controllers/helm.cattle.io"
-	util2 "github.com/k3s-io/k3s/pkg/agent/util"
-	"github.com/k3s-io/k3s/pkg/daemons/agent"
-	"github.com/k3s-io/k3s/pkg/daemons/config"
 	daemonconfig "github.com/k3s-io/k3s/pkg/daemons/config"
 	"github.com/k3s-io/k3s/pkg/version"
-	"github.com/libp2p/go-netroute"
 	"github.com/pkg/errors"
+	"github.com/rancher/rke2/pkg/logging"
 	"github.com/sirupsen/logrus"
+	opv1 "github.com/tigera/operator/api/v1"
+	"golang.org/x/sys/windows"
 	authv1 "k8s.io/api/authentication/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"sigs.k8s.io/yaml"
+
 	"k8s.io/utils/pointer"
 )
 
-type Calico struct{}
+var (
+	calicoKubeConfigTemplate = template.Must(template.New("Kubeconfig").Parse(`apiVersion: v1
+kind: Config
+clusters:
+- name: kubernetes
+  cluster:
+    certificate-authority: {{ .KubeConfig.CertificateAuthority }}
+    server: {{ .KubeConfig.Server }}
+contexts:
+- name: calico-windows@kubernetes
+  context:
+    cluster: kubernetes
+    namespace: kube-system
+    user: calico-windows
+current-context: calico-windows@kubernetes
+users:
+- name: calico-windows
+  user:
+    token: {{ .KubeConfig.Token }}
+`))
+
+	// Config following definition from https://github.com/projectcalico/calico/blob/master/cni-plugin/pkg/types/types.go#L65-L131
+	calicoConfigTemplate = template.Must(template.New("CalicoConfig").Funcs(replaceSlashWin).Parse(`{
+  "name": "{{ .Name }}",
+  "windows_use_single_network": true,
+  "cniVersion": "{{ .CNIVersion }}",
+  "type": "calico",
+  "mode": "{{ .OverlayEncap }}",
+  "vxlan_mac_prefix": "0E-2A",
+  "vxlan_vni": {{ .VxlanVNI }},
+  "policy": {
+    "type": "k8s"
+  },
+  "log_level": "info",
+  "capabilities": {"dns": true},
+  "DNS": {
+    "Nameservers": [
+		"{{ .DNSServers }}"
+    ],
+    "Search":  [
+      "svc.cluster.local"
+    ]
+  },
+  "nodename_file": "{{ replace .NodeNameFile }}",
+  "datastore_type": "{{ .DatastoreType }}",
+  "etcd_endpoints": "{{ .ETCDEndpoints }}",
+  "etcd_key_file": "{{ .ETCDKeyFile }}",
+  "etcd_cert_file": "{{ .ETCDCertFile }}",
+  "etcd_ca_cert_file": "{{ .ETCDCaCertFile }}",
+  "kubernetes": {
+    "kubeconfig": "{{ replace .KubeConfig.Path }}"
+  },
+  "ipam": {
+    "type": "{{ .IpamType }}",
+    "subnet": "usePodCidr"
+  },
+  "policies":  [
+    {
+      "Name":  "EndpointPolicy",
+      "Value":  {
+        "Type":  "OutBoundNAT",
+        "ExceptionList":  [
+          "{{ .ServiceCIDR }}"
+        ]
+      }
+    },
+    {
+      "Name":  "EndpointPolicy",
+      "Value":  {
+        "Type":  "SDNROUTE",
+        "DestinationPrefix":  "{{ .ServiceCIDR }}",
+        {{- if eq .OverlayEncap "vxlan" }}
+        "NeedEncap": true
+	{{- else }}
+        "NeedEncap": false
+	{{- end }}
+      }
+    }
+  ]
+}
+`))
+)
+
+type Calico struct {
+	CNICfg     *CalicoConfig
+	KubeClient *kubernetes.Clientset
+}
 
 const (
 	CalicoConfigName       = "10-calico.conf"
@@ -48,21 +131,114 @@ const (
 	calicoNode             = "calico-node"
 )
 
+// GetConfig returns the CNI configuration
+func (c *Calico) GetConfig() *CNICommonConfig {
+	return &c.CNICfg.CNICommonConfig
+}
+
 // Setup creates the basic configuration required by the CNI.
-func (c *Calico) Setup(ctx context.Context, dataDir string, nodeConfig *daemonconfig.Node, restConfig *rest.Config) (*CNIConfig, error) {
-	calicoKubeConfig := CalicoKubeConfig{
-		Server:               "https://127.0.0.1:6443",
-		CertificateAuthority: filepath.Join("c:\\", dataDir, "agent", "server-ca.crt"),
-		Token:                "",
-		Path:                 filepath.Join("c:\\", dataDir, "agent", CalicoKubeConfigName),
+func (c *Calico) Setup(ctx context.Context, nodeConfig *daemonconfig.Node, restConfig *rest.Config, dataDir string) error {
+	if err := c.initializeConfig(ctx, nodeConfig, restConfig, dataDir); err != nil {
+		return err
 	}
 
-	client, err := coreClient(restConfig)
+	if err := c.overrideCalicoConfigByHelm(restConfig); err != nil {
+		return err
+	}
+
+	if err := c.writeConfigFiles(); err != nil {
+		return err
+	}
+
+	logrus.Info("Generating HNS networks, please wait")
+	return c.generateCalicoNetworks()
+}
+
+// initializeConfig sets the default configuration in CNIConfig
+func (c *Calico) initializeConfig(ctx context.Context, nodeConfig *daemonconfig.Node, restConfig *rest.Config, dataDir string) error {
+	platformType, err := platformType()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	serviceAccounts := client.CoreV1().ServiceAccounts(CalicoSystemNamespace)
 
+	c.CNICfg = &CalicoConfig{
+		CNICommonConfig: CNICommonConfig{
+			Name:           "Calico",
+			OverlayNetName: "Calico",
+			OverlayEncap:   "vxlan",
+			Hostname:       nodeConfig.AgentConfig.NodeName,
+			ConfigPath:     filepath.Join("c:\\", dataDir, "agent"),
+			CNIConfDir:     nodeConfig.AgentConfig.CNIConfDir,
+			CNIBinDir:      nodeConfig.AgentConfig.CNIBinDir,
+			ClusterCIDR:    nodeConfig.AgentConfig.ClusterCIDR.String(),
+			ServiceCIDR:    nodeConfig.AgentConfig.ServiceCIDR.String(),
+			NodeIP:         nodeConfig.AgentConfig.NodeIP,
+			VxlanVNI:       "4096",
+			VxlanPort:      "4789",
+			IpamType:       "calico-ipam",
+			CNIVersion:     "0.3.1",
+		},
+		NodeNameFile:          filepath.Join("c:\\", dataDir, "agent", CalicoNodeNameFileName),
+		KubeNetwork:           "Calico.*",
+		DNSServers:            nodeConfig.AgentConfig.ClusterDNS.String(),
+		DNSSearch:             "svc." + nodeConfig.AgentConfig.ClusterDomain,
+		DatastoreType:         "kubernetes",
+		Platform:              platformType,
+		IPAutoDetectionMethod: "first-found",
+	}
+
+	c.CNICfg.KubeConfig, c.KubeClient, err = c.createKubeConfigAndClient(ctx, restConfig)
+	if err != nil {
+		return err
+	}
+
+	logrus.Debugf("Calico Config: %+v", c.CNICfg)
+
+	return nil
+}
+
+// writeConfigFiles writes the three required files by Calico
+func (c *Calico) writeConfigFiles() error {
+
+	// Create CalicoKubeConfig and CIPAutoDetectionMethodalicoConfig files
+	if err := c.renderCalicoConfig(c.CNICfg.KubeConfig.Path, calicoKubeConfigTemplate); err != nil {
+		return err
+	}
+
+	if err := c.renderCalicoConfig(filepath.Join(c.CNICfg.CNIConfDir, CalicoConfigName), calicoConfigTemplate); err != nil {
+		return err
+	}
+
+	return os.WriteFile(filepath.Join(c.CNICfg.ConfigPath, CalicoNodeNameFileName), []byte(c.CNICfg.Hostname), 0644)
+}
+
+// renderCalicoConfig creates the file and then renders the template using Calico Config parameters
+func (c *Calico) renderCalicoConfig(path string, toRender *template.Template) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	output, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+
+	defer output.Close()
+	toRender.Execute(output, c.CNICfg)
+
+	return nil
+}
+
+// createKubeConfigAndClient creates all needed for Calico to contact kube-api
+func (c *Calico) createKubeConfigAndClient(ctx context.Context, restConfig *rest.Config) (*KubeConfig, *kubernetes.Clientset, error) {
+
+	// Fill all information except for the token
+	calicoKubeConfig := KubeConfig{
+		Server:               "https://127.0.0.1:6443",
+		CertificateAuthority: filepath.Join(c.CNICfg.ConfigPath, "server-ca.crt"),
+		Path:                 filepath.Join(c.CNICfg.ConfigPath, CalicoKubeConfigName),
+	}
+
+	// Generate the token request
 	req := authv1.TokenRequest{
 		Spec: authv1.TokenRequestSpec{
 			Audiences:         []string{version.Program},
@@ -70,130 +246,216 @@ func (c *Calico) Setup(ctx context.Context, dataDir string, nodeConfig *daemonco
 		},
 	}
 
+	// Register the token in the Calico service account
+	client, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+	serviceAccounts := client.CoreV1().ServiceAccounts(CalicoSystemNamespace)
 	token, err := serviceAccounts.CreateToken(ctx, calicoNode, &req, metav1.CreateOptions{})
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to create token for service account (%s/%s)", CalicoSystemNamespace, calicoNode)
+		return nil, nil, errors.Wrapf(err, "failed to create token for service account (%s/%s)", CalicoSystemNamespace, calicoNode)
 	}
+
 	calicoKubeConfig.Token = token.Status.Token
 
-	cfg := &CNIConfig{NodeConfig: nodeConfig, NetworkName: "Calico", BindAddress: nodeConfig.AgentConfig.NodeIP}
-
-	hc, err := helm.NewFactoryFromConfig(restConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := getDefaultConfig(cfg, dataDir, nodeConfig); err != nil {
-		return nil, err
-	}
-
-	cfg.CalicoConfig.KubeConfig = calicoKubeConfig
-	if err := getCNIConfigOverrides(cfg, hc); err != nil {
-		return nil, err
-	}
-
-	agent.NetworkName = CalicoHnsNetworkName
-
-	if err := createNodeNameFile(cfg, dataDir); err != nil {
-		return nil, err
-	}
-	if err := createKubeConfig(cfg, dataDir); err != nil {
-		return nil, err
-	}
-
-	if err := createCNIConfig(cfg); err != nil {
-		return nil, err
-	}
-
-	logrus.Info("Generating HNS networks, please wait")
-	if err := generateCalicoNetworks(cfg.CalicoConfig.NetworkingBackend); err != nil {
-		return nil, err
-	}
-
-	return cfg, nil
+	return &calicoKubeConfig, client, nil
 }
 
 // Start starts the CNI services on the Windows node.
-func (c *Calico) Start(ctx context.Context, config *CNIConfig) error {
-	for {
-		if err := startCalico(ctx, config.CalicoConfig); err != nil {
-			continue
+func (c *Calico) Start(ctx context.Context) error {
+	logPath := filepath.Join(c.CNICfg.ConfigPath, "logs")
+
+	// Wait for the node to be registered in the cluster
+	if err := wait.PollImmediateWithContext(ctx, 5*time.Second, 5*time.Minute, func(ctx context.Context) (bool, error) {
+		_, err := c.KubeClient.CoreV1().Nodes().Get(ctx, c.CNICfg.Hostname, metav1.GetOptions{})
+		if err != nil {
+			logrus.WithError(err).Warningf("Calico can't start because it can't find node, retrying %s", c.CNICfg.Hostname)
+			return false, nil
 		}
-		break
+
+		logrus.Infof("Node %s registered. Calico can start", c.CNICfg.Hostname)
+
+		if err := startCalico(ctx, c.CNICfg, logPath); err != nil {
+			logrus.Errorf("Calico exited: %v. Retrying", err)
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		return err
 	}
-	go startFelix(ctx, config.CalicoConfig)
+
+	go startFelix(ctx, c.CNICfg, logPath)
+	if c.CNICfg.OverlayEncap == "windows-bgp" {
+		go startConfd(ctx, c.CNICfg, logPath)
+	}
+
+	// Delete policies in case calico network is being reused
+	policies, _ := hcsshim.HNSListPolicyListRequest()
+	for _, policy := range policies {
+		policy.Delete()
+	}
+
+	logrus.Info("Calico started correctly")
 
 	return nil
 }
 
-// createNodeNameFile creates the node name file required by the CNI.
-func createNodeNameFile(config *CNIConfig, dataDir string) error {
-	return util2.WriteFile(config.CalicoConfig.KubeConfig.Path, config.NodeConfig.AgentConfig.NodeName)
-}
+// generateCalicoNetworks creates the overlay networks for internode networking
+func (c *Calico) generateCalicoNetworks() error {
+	nodeRebooted, err := c.isNodeRebooted()
+	if err != nil {
+		return errors.Wrapf(err, "failed to check last node reboot time")
+	}
+	if nodeRebooted {
+		if err = deleteAllNetworks(); err != nil {
+			return errors.Wrapf(err, "failed to delete all networks before bootstrapping calico")
+		}
+	}
 
-// createKubeConfig creates the kube config required by the CNI.
-func createKubeConfig(config *CNIConfig, dataDir string) error {
-	kubeTemplate, err := parseTemplateFromConfig(calicoKubeConfigTemplate, config)
+	// There are four ways to select the vxlan interface. In order of priority:
+	// 1 - VXLAN_ADAPTER env variable
+	// 2 - c.CNICfg.Interface which set if NodeAddressAutodetection is set (Calico HelmChart)
+	// 3 - nodeIP if defined
+	// 4 - None of the above. In that case, by default the interface with the default route is picked
+	networkAdapter := os.Getenv("VXLAN_ADAPTER")
+	if networkAdapter == "" {
+		if c.CNICfg.Interface != "" {
+			networkAdapter = c.CNICfg.Interface
+		}
+
+		if c.CNICfg.Interface == "" && c.CNICfg.NodeIP != "" {
+			iFace, err := findInterface(c.CNICfg.NodeIP)
+			if err != nil {
+				return err
+			}
+			networkAdapter = iFace
+		}
+	}
+
+	mgmt, err := createHnsNetwork(c.CNICfg.OverlayEncap, networkAdapter)
 	if err != nil {
 		return err
 	}
-	return util2.WriteFile(filepath.Join("c:\\", dataDir, "agent", CalicoKubeConfigName), kubeTemplate)
-}
 
-// createCNIConfig creates the CNI config for the CNI.
-func createCNIConfig(config *CNIConfig) error {
-	parsedTemplate, err := parseTemplateFromConfig(calicoConfigTemplate, config)
-	if err != nil {
-		return err
+	if c.CNICfg.Platform == "ec2" || c.CNICfg.Platform == "gce" {
+		logrus.Debugf("recreating metadata route because platform is: %s", c.CNICfg.Platform)
+		if err := setMetaDataServerRoute(mgmt); err != nil {
+			return err
+		}
 	}
-	return util2.WriteFile(filepath.Join(config.NodeConfig.AgentConfig.CNIConfDir, CalicoConfigName), parsedTemplate)
-}
-
-// getDefaultConfig sets the default configuration.
-func getDefaultConfig(config *CNIConfig, dataDir string, nodeConfig *config.Node) error {
-	platformType, err := getPlatformType()
-	if err != nil {
-		return err
-	}
-
-	calicoCfg := &CalicoConfig{
-		Name:                  "Calico",
-		Hostname:              nodeConfig.AgentConfig.NodeName,
-		NodeNameFile:          filepath.Join("c:\\", dataDir, "agent", CalicoNodeNameFileName),
-		KubeNetwork:           "Calico.*",
-		Mode:                  "vxlan",
-		ServiceCIDR:           nodeConfig.AgentConfig.ServiceCIDR.String(),
-		DNSServers:            nodeConfig.AgentConfig.ClusterDNS.String(),
-		DNSSearch:             "svc." + nodeConfig.AgentConfig.ClusterDomain,
-		DatastoreType:         "kubernetes",
-		NetworkingBackend:     "vxlan",
-		Platform:              platformType,
-		StartUpValidIPTimeout: 90,
-		LogDir:                "",
-		IP:                    "autodetect",
-		Felix: FelixConfig{
-			Metadataaddr:    "none",
-			Vxlanvni:        "4096",
-			MacPrefix:       "0E-2A",
-			LogSeverityFile: "none",
-			LogSeveritySys:  "none",
-		},
-		CNI: CalicoCNIConfig{
-			BinDir:   nodeConfig.AgentConfig.CNIBinDir,
-			ConfDir:  nodeConfig.AgentConfig.CNIConfDir,
-			IpamType: "calico-ipam",
-			Version:  "0.3.1",
-		},
-	}
-	config.CalicoConfig = calicoCfg
 	return nil
 }
 
-func startFelix(ctx context.Context, config *CalicoConfig) {
+// overrideCalicoConfigByHelm overrides the default values set for calico if a Chart exists
+func (c *Calico) overrideCalicoConfigByHelm(restConfig *rest.Config) error {
+	hc, err := helm.NewFactoryFromConfig(restConfig)
+	if err != nil {
+		return err
+	}
+
+	cniChartConfig, err := hc.Helm().V1().HelmChartConfig().Get(metav1.NamespaceSystem, CalicoChart, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to check for %s HelmChartConfig", CalicoChart)
+	}
+	if cniChartConfig == nil {
+		logrus.Debug("no CNI related HelmChartConfig found")
+		return nil
+	}
+	overrides := CalicoInstallation{}
+	if err := yaml.Unmarshal([]byte(cniChartConfig.Spec.ValuesContent), &overrides); err != nil {
+		return err
+	}
+	// Marshal for clean debug logs, otherwise it's all pointers
+	b, err := yaml.Marshal(overrides)
+	if err != nil {
+		return err
+	}
+	logrus.Debugf("calico override found: %s\n", string(b))
+	if nodeV4 := overrides.Installation.CalicoNetwork.NodeAddressAutodetectionV4; nodeV4 != nil {
+		c.CNICfg.IPAutoDetectionMethod, c.CNICfg.Interface, err = findCalicoInterface(nodeV4)
+		if err != nil {
+			return err
+		}
+	}
+	if bgpEnabled := overrides.Installation.CalicoNetwork.BGP; bgpEnabled != nil {
+		if *bgpEnabled == opv1.BGPEnabled {
+			c.CNICfg.OverlayEncap = "windows-bgp"
+		}
+	}
+	return nil
+}
+
+// findCalicoInterface finds the interface to use for Calico based on the NodeAddressAutodetectionV4
+func findCalicoInterface(nodeV4 *opv1.NodeAddressAutodetection) (IPAutoDetectionMethod, calicoInterface string, err error) {
+	IPAutoDetectionMethod, err = nodeAddressAutodetection(*nodeV4)
+	if err != nil {
+		return "", "", err
+	}
+
+	if strings.Contains(IPAutoDetectionMethod, "cidrs") {
+		calicoInterface, err = findInterfaceCIDR(nodeV4.CIDRS)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	if strings.Contains(IPAutoDetectionMethod, "interface") {
+		calicoInterface, err = findInterfaceRegEx(nodeV4.Interface)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	if strings.Contains(IPAutoDetectionMethod, "can-reach") {
+		calicoInterface, err = findInterfaceReach(nodeV4.CanReach)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	return
+}
+
+// startConfd starts the confd service (for BGP)
+func startConfd(ctx context.Context, config *CalicoConfig, logPath string) {
+	outputFile := logging.GetLogger(filepath.Join(logPath, "confd.log"), 50)
+
+	specificEnvs := []string{
+		fmt.Sprintf("PATH=%s", os.Getenv("PATH")),
+	}
+
+	args := []string{
+		"-confd",
+		fmt.Sprintf("-confd-confdir=%s", filepath.Join(config.CNIBinDir, "confd")),
+	}
+
+	logrus.Infof("Confd Envs: %s", append(generateGeneralCalicoEnvs(config), specificEnvs...))
+	cmd := exec.CommandContext(ctx, "calico-node.exe", args...)
+	cmd.Env = append(generateGeneralCalicoEnvs(config), specificEnvs...)
+	cmd.Stdout = outputFile
+	cmd.Stderr = outputFile
+	_ = os.Chdir(filepath.Join(config.CNIBinDir, "confd"))
+	_ = cmd.Run()
+	logrus.Error("Confd exited")
+}
+
+// startFelix starts the felix service
+func startFelix(ctx context.Context, config *CalicoConfig, logPath string) {
+	outputFile := logging.GetLogger(filepath.Join(logPath, "felix.log"), 50)
+
 	specificEnvs := []string{
 		fmt.Sprintf("FELIX_FELIXHOSTNAME=%s", config.Hostname),
-		fmt.Sprintf("FELIX_VXLANVNI=%s", config.Felix.Vxlanvni),
-		fmt.Sprintf("FELIX_METADATAADDR=%s", config.Felix.Metadataaddr),
+		fmt.Sprintf("FELIX_VXLANVNI=%s", config.VxlanVNI),
+		fmt.Sprintf("FELIX_DATASTORETYPE=%s", config.DatastoreType),
+	}
+
+	// Add OS variables related to Felix. As they come after, they'll overwrite the previous ones
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, "FELIX_") {
+			specificEnvs = append(specificEnvs, env)
+		}
 	}
 
 	args := []string{
@@ -203,16 +465,29 @@ func startFelix(ctx context.Context, config *CalicoConfig) {
 	logrus.Infof("Felix Envs: %s", append(generateGeneralCalicoEnvs(config), specificEnvs...))
 	cmd := exec.CommandContext(ctx, "calico-node.exe", args...)
 	cmd.Env = append(generateGeneralCalicoEnvs(config), specificEnvs...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		logrus.Errorf("Felix exited: %v", err)
-	}
+	cmd.Stdout = outputFile
+	cmd.Stderr = outputFile
+	_ = cmd.Run()
+	logrus.Error("Felix exited")
 }
 
-func startCalico(ctx context.Context, config *CalicoConfig) error {
+// startCalico starts the calico service
+func startCalico(ctx context.Context, config *CalicoConfig, logPath string) error {
+	outputFile := logging.GetLogger(filepath.Join(logPath, "calico-node.log"), 50)
+
 	specificEnvs := []string{
 		fmt.Sprintf("CALICO_NODENAME_FILE=%s", config.NodeNameFile),
+		fmt.Sprintf("CALICO_NETWORKING_BACKEND=%s", config.OverlayEncap),
+		fmt.Sprintf("CALICO_DATASTORE_TYPE=%s", config.DatastoreType),
+		fmt.Sprintf("IP_AUTODETECTION_METHOD=%s", config.IPAutoDetectionMethod),
+		fmt.Sprintf("VXLAN_VNI=%s", config.VxlanVNI),
+	}
+
+	// Add OS variables related to Calico. As they come after, they'll overwrite the previous ones
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, "CALICO_") {
+			specificEnvs = append(specificEnvs, env)
+		}
 	}
 
 	args := []string{
@@ -221,320 +496,82 @@ func startCalico(ctx context.Context, config *CalicoConfig) error {
 	logrus.Infof("Calico Envs: %s", append(generateGeneralCalicoEnvs(config), specificEnvs...))
 	cmd := exec.CommandContext(ctx, "calico-node.exe", args...)
 	cmd.Env = append(generateGeneralCalicoEnvs(config), specificEnvs...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = outputFile
+	cmd.Stderr = outputFile
 	if err := cmd.Run(); err != nil {
-		logrus.Errorf("Calico exited: %v", err)
 		return err
 	}
 	return nil
-}
-
-func deleteAllNetworksOnNodeRestart(backend string) error {
-	logrus.Debug("Deleting networks.")
-	backends := map[string]bool{
-		"windows-bgp": true,
-		"vxlan":       true,
-	}
-
-	if backends[backend] {
-		networks, err := hcsshim.HNSListNetworkRequest("GET", "", "")
-		if err != nil {
-			return err
-		}
-
-		for _, n := range networks {
-			if n.Name != "nat" {
-				_, err = n.Delete()
-				if err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func checkForCorrectInterface() (bool, error) {
-	logrus.Debug("Getting all interfaces")
-	iFaces, err := net.Interfaces()
-	if err != nil {
-		return false, err
-	}
-
-	for _, iFace := range iFaces {
-		addrs, err := iFace.Addrs()
-		if err != nil {
-			return false, err
-		}
-		for _, addr := range addrs {
-			if addr.(*net.IPNet).IP.To4() != nil {
-				match1, _ := regexp.Match("(^127\\.0\\.0\\.)", addr.(*net.IPNet).IP)
-				match2, _ := regexp.Match("(^169\\.254\\.)", addr.(*net.IPNet).IP)
-				if !(match1 || match2) {
-					return true, nil
-				}
-			}
-		}
-	}
-
-	return false, nil
-}
-
-func generateCalicoNetworks(backend string) error {
-	platform, err := getPlatformType()
-	if err != nil {
-		return err
-	}
-
-	if err := deleteAllNetworksOnNodeRestart(backend); err != nil {
-		return err
-	}
-
-	good, err := checkForCorrectInterface()
-	if err != nil {
-		return err
-	}
-	if !good {
-		return fmt.Errorf("no interfaces found")
-	}
-
-	if err := createExternalNetwork(backend); err != nil {
-		return err
-	}
-
-	logrus.Debug("Waiting for management ip..")
-	mgmt := waitForManagementIP(CalicoHnsNetworkName)
-	if platform == "ec2" || platform == "gce" {
-		logrus.Debugf("recreating metadata route because platform is: %s", platform)
-		if err := setMetaDataServerRoute(mgmt); err != nil {
-			return err
-		}
-	}
-	if backend == "windows-bgp" {
-		// Not supported yet, this does work.
-		_ = wapi.StopService("RemoteAccess")
-		_ = wapi.StartService("RemoteAccess")
-	}
-	return nil
-}
-
-func checkIfNetworkExists(n string) bool {
-	if _, err := hcsshim.GetHNSNetworkByName(n); err != nil {
-		return false
-	}
-	return true
-}
-
-func createExternalNetwork(backend string) error {
-	logrus.Debug("Creating external network")
-	for !(checkIfNetworkExists(CalicoHnsNetworkName)) {
-		logrus.Debugf("Networking doesn't exist yet: %s ", CalicoHnsNetworkName)
-		var network hcsshim.HNSNetwork
-		if backend == "vxlan" {
-			logrus.Debugf("Backend is vxlan")
-			// Ignoring the return because both true and false without an error represent that the firewall rule
-			// was created or already exists
-			if _, err := wapi.FirewallRuleAdd(
-				"OverlayTraffic4789UDP",
-				"Overlay network traffic UDP",
-				"",
-				"4789",
-				wapi.NET_FW_IP_PROTOCOL_UDP,
-				wapi.NET_FW_PROFILE2_ALL,
-			); err != nil {
-				logrus.Debugf("error creating firewall rules: %s", err)
-				return err
-			}
-			logrus.Debug("Creating VXLAN network")
-			network = hcsshim.HNSNetwork{
-				Type: "Overlay",
-				Name: CalicoHnsNetworkName,
-				Subnets: []hcsshim.Subnet{
-					{
-						AddressPrefix:  "192.168.255.0/30",
-						GatewayAddress: "192.168.255.1",
-						Policies: []json.RawMessage{
-							[]byte("{ \"Type\": \"VSID\", \"VSID\": 9999 }"),
-						},
-					},
-				},
-			}
-		} else {
-			network = hcsshim.HNSNetwork{
-				Type: "L2Bridge",
-				Name: CalicoHnsNetworkName,
-				Subnets: []hcsshim.Subnet{
-					{
-						AddressPrefix:  "192.168.255.0/30",
-						GatewayAddress: "192.168.255.1",
-					},
-				},
-			}
-		}
-
-		logrus.Debugf("Creating network.")
-		if _, err := network.Create(); err != nil {
-			logrus.Debugf("waiting for network %s", err)
-			time.Sleep(1 * time.Second)
-		}
-	}
-	return nil
-}
-
-func getPlatformType() (string, error) {
-	aksNet, _ := hcsshim.GetHNSNetworkByName("azure")
-	if aksNet != nil {
-		return "aks", nil
-	}
-
-	eksNet, _ := hcsshim.GetHNSNetworkByName("vpcbr*")
-	if eksNet != nil {
-		return "eks", nil
-	}
-
-	// EC2
-	ec2Resp, err := http.Get("http://169.254.169.254/latest/meta-data/local-hostname")
-	if err != nil && hasTimedOut(err) {
-		return "", err
-	}
-	if ec2Resp != nil {
-		defer ec2Resp.Body.Close()
-		if ec2Resp.StatusCode == http.StatusOK {
-			return "ec2", nil
-		}
-	}
-
-	// GCE
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", "http://metadata.google.internal/computeMetadata/v1/instance/hostname", nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Add("Metadata-Flavor", "Google")
-	gceResp, err := client.Do(req)
-	if err != nil && hasTimedOut(err) {
-		return "", err
-	}
-	if gceResp != nil {
-		defer gceResp.Body.Close()
-		if gceResp.StatusCode == http.StatusOK {
-			return "gce", nil
-		}
-	}
-
-	return "bare-metal", nil
-}
-
-func hasTimedOut(err error) bool {
-	switch err := err.(type) {
-	case *url.Error:
-		if err, ok := err.Err.(net.Error); ok && err.Timeout() {
-			return true
-		}
-	case net.Error:
-		if err.Timeout() {
-			return true
-		}
-	case *net.OpError:
-		if err.Timeout() {
-			return true
-		}
-	}
-	errTxt := "use of closed network connection"
-	if err != nil && strings.Contains(err.Error(), errTxt) {
-		return true
-	}
-	return false
-}
-
-func autoConfigureIpam(it string) bool {
-	if it == "host-local" {
-		return true
-	}
-	return false
-}
-
-func waitForManagementIP(networkName string) string {
-	for {
-		network, err := hcsshim.GetHNSNetworkByName(networkName)
-		if err != nil {
-			logrus.Debugf("error getting management ip: %s", err)
-			continue
-		}
-		return network.ManagementIP
-	}
-}
-
-func setMetaDataServerRoute(mgmt string) error {
-	ip := net.ParseIP(mgmt)
-	if ip == nil {
-		return fmt.Errorf("not a valid ip")
-	}
-
-	metaIp := net.ParseIP("169.254.169.254/32")
-	router, err := netroute.New()
-	if err != nil {
-		return err
-	}
-
-	_, _, preferredSrc, err := router.Route(ip)
-	if err != nil {
-		return err
-	}
-
-	_, _, _, err = router.RouteWithSrc(nil, preferredSrc, metaIp) // input not used on windows
-	return err
 }
 
 func generateGeneralCalicoEnvs(config *CalicoConfig) []string {
 	return []string{
 		fmt.Sprintf("KUBE_NETWORK=%s", config.KubeNetwork),
-		fmt.Sprintf("KUBECONFIG=%s", config.KubeConfig.Path),
-		fmt.Sprintf("K8S_SERVICE_CIDR=%s", config.ServiceCIDR),
+		fmt.Sprintf("KUBECONFIG=%s", filepath.Join(config.ConfigPath, CalicoKubeConfigName)),
 		fmt.Sprintf("NODENAME=%s", config.Hostname),
-
-		fmt.Sprintf("CALICO_NETWORKING_BACKEND=%s", config.NetworkingBackend),
-		fmt.Sprintf("CALICO_DATASTORE_TYPE=%s", config.DatastoreType),
 		fmt.Sprintf("CALICO_K8S_NODE_REF=%s", config.Hostname),
-		fmt.Sprintf("CALICO_LOG_DIR=%s", config.LogDir),
 
-		fmt.Sprintf("DNS_NAME_SERVERS=%s", config.DNSServers),
-		fmt.Sprintf("DNS_SEARCH=%s", config.DNSSearch),
-
-		fmt.Sprintf("ETCD_ENDPOINTS=%s", config.Felix.Vxlanvni),
-		fmt.Sprintf("ETCD_KEY_FILE=%s", config.Felix.Metadataaddr),
-		fmt.Sprintf("ETCD_CERT_FILE=%s", config.Felix.Vxlanvni),
-		fmt.Sprintf("ETCD_CA_CERT_FILE=%s", config.Felix.Metadataaddr),
-
-		fmt.Sprintf("CNI_BIN_DIR=%s", config.CNI.BinDir),
-		fmt.Sprintf("CNI_CONF_DIR=%s", config.CNI.ConfDir),
-		fmt.Sprintf("CNI_CONF_FILENAME=%s", config.CNI.ConfFileName),
-		fmt.Sprintf("CNI_IPAM_TYPE=%s", config.CNI.IpamType),
-
-		fmt.Sprintf("FELIX_LOGSEVERITYFILE=%s", config.Felix.LogSeverityFile),
-		fmt.Sprintf("FELIX_LOGSEVERITYSYS=%s", config.Felix.LogSeveritySys),
-
-		fmt.Sprintf("STARTUP_VALID_IP_TIMEOUT=90"),
-		fmt.Sprintf("IP=%s", config.IP),
-		fmt.Sprintf("USE_POD_CIDR=%t", autoConfigureIpam(config.CNI.IpamType)),
-
-		fmt.Sprintf("VXLAN_VNI=%s", config.Felix.Vxlanvni),
+		fmt.Sprintf("IP=%s", config.NodeIP),
+		fmt.Sprintf("USE_POD_CIDR=%t", autoConfigureIpam(config.IpamType)),
 	}
 }
 
-// getCNIConfigOverrides overrides the default values set for the CNI.
-func getCNIConfigOverrides(cniConfig *CNIConfig, hc *helm.Factory) error {
-	if _, err := hc.Helm().V1().HelmChartConfig().Get(metav1.NamespaceSystem, CalicoChart, metav1.GetOptions{}); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
+// ReserveSourceVip reserves a source VIP for kube-proxy
+func (c *Calico) ReserveSourceVip(ctx context.Context) (string, error) {
+	var vip string
+
+	if err := wait.PollImmediateWithContext(ctx, 5*time.Second, 5*time.Minute, func(ctx context.Context) (bool, error) {
+		// calico-node is creating an endpoint named Calico_ep for this purpose
+		endpoint, err := hcsshim.GetHNSEndpointByName("Calico_ep")
+		if err != nil {
+			logrus.WithError(err).Warning("can't find Calico_ep HNS endpoint, retrying")
+			return false, nil
 		}
-		return fmt.Errorf("failed to check for %s HelmChartConfig", CalicoChart)
+		vip = endpoint.IPAddress.String()
+		return true, nil
+	}); err != nil {
+		return "", err
 	}
-	logrus.Debug("custom calico configuration isn't currently supported")
+
+	return vip, nil
+}
+
+//Get latest stored reboot
+func (c *Calico) getStoredLastBootTime() (string, error) {
+	lastRebootPath := filepath.Join(c.CNICfg.ConfigPath, "lastBootTime.txt")
+	lastStoredBoot, err := os.ReadFile(lastRebootPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		} else {
+			return "", err
+		}
+	}
+	return string(lastStoredBoot), nil
+}
+
+//Set last boot time on the registry
+func (c *Calico) setStoredLastBootTime(lastBootTime string) error {
+	lastRebootPath := filepath.Join(c.CNICfg.ConfigPath, "lastBootTime.txt")
+	err := os.WriteFile(lastRebootPath, []byte(lastBootTime), 0644)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
-func coreClient(restConfig *rest.Config) (kubernetes.Interface, error) {
-	return kubernetes.NewForConfig(restConfig)
+// Check if the node was rebooted
+func (c *Calico) isNodeRebooted() (bool, error) {
+	tickCountSinceBoot := windows.DurationSinceBoot()
+	bootTime := time.Now().Add(-tickCountSinceBoot)
+	lastReboot := bootTime.Format(time.UnixDate)
+	prevLastReboot, err := c.getStoredLastBootTime()
+	if err != nil {
+		return true, err
+	}
+	if lastReboot == prevLastReboot {
+		return false, nil
+	}
+	err = c.setStoredLastBootTime(lastReboot)
+	return true, err
 }

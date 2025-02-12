@@ -15,8 +15,10 @@ func main() {
 		cmds.NewServerCommand(),
 		cmds.NewAgentCommand(),
 		cmds.NewEtcdSnapshotCommand(),
-		cmds.NewCertRotateCommand(),
+		cmds.NewCertCommand(),
 		cmds.NewSecretsEncryptCommand(),
+		cmds.NewTokenCommand(),
+		cmds.NewCompletionCommand(),
 	}
 
 	if err := app.Run(configfilearg.MustParse(os.Args)); err != nil {

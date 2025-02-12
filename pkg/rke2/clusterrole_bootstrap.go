@@ -13,10 +13,13 @@ const (
 	kubeProxyName                   = "system:kube-proxy"
 	tunnelControllerName            = "system:rke2-controller"
 	cloudControllerManagerName      = "rke2-cloud-controller-manager"
-	legacyGroup                     = ""
-	coordinationGroup               = "coordination.k8s.io"
-	networkingGroup                 = "networking.k8s.io"
-	helmGroup                       = "helm.cattle.io"
+
+	appsGroup         = "apps"
+	coordinationGroup = "coordination.k8s.io"
+	helmGroup         = "helm.cattle.io"
+	legacyGroup       = ""
+	networkingGroup   = "networking.k8s.io"
+	discoveryGroup    = "discovery.k8s.io"
 )
 
 var (
@@ -45,16 +48,19 @@ func clusterRoles() []rbacv1.ClusterRole {
 			},
 		},
 		{
+			// this should be kept in sync with the ClusterRole in k3s:
+			// https://github.com/k3s-io/k3s/blob/master/manifests/ccm.yaml
 			ObjectMeta: metav1.ObjectMeta{Name: cloudControllerManagerName},
 			Rules: []rbacv1.PolicyRule{
 				rbacv1helpers.NewRule("get", "create", "update").Groups(coordinationGroup).Resources("leases").RuleOrDie(),
 				rbacv1helpers.NewRule("create", "patch", "update").Groups(legacyGroup).Resources("events").RuleOrDie(),
 				rbacv1helpers.NewRule("*").Groups(legacyGroup).Resources("nodes").RuleOrDie(),
-				rbacv1helpers.NewRule("patch").Groups(legacyGroup).Resources("nodes/status").RuleOrDie(),
-				rbacv1helpers.NewRule("list", "watch", "patch", "update").Groups(legacyGroup).Resources("services").RuleOrDie(),
-				rbacv1helpers.NewRule("create").Groups(legacyGroup).Resources("serviceaccounts").RuleOrDie(),
-				rbacv1helpers.NewRule("get", "list", "watch", "update").Groups("").Resources("persistentvolumes").RuleOrDie(),
-				rbacv1helpers.NewRule("create", "get", "list", "watch", "update").Groups(legacyGroup).Resources("endpoints").RuleOrDie(),
+				rbacv1helpers.NewRule("patch").Groups(legacyGroup).Resources("nodes/status", "services/status").RuleOrDie(),
+				rbacv1helpers.NewRule("get", "list", "watch", "patch", "update").Groups(legacyGroup).Resources("services", "pods").RuleOrDie(),
+				rbacv1helpers.NewRule("create", "get").Groups(legacyGroup).Resources("serviceaccounts").RuleOrDie(),
+				rbacv1helpers.NewRule("create", "get").Groups("").Resources("namespaces").RuleOrDie(),
+				rbacv1helpers.NewRule("*").Groups(appsGroup).Resources("daemonsets").RuleOrDie(),
+				rbacv1helpers.NewRule("get", "list", "watch").Groups(discoveryGroup).Resources("endpointslices").RuleOrDie(),
 			},
 		},
 	}
@@ -96,7 +102,7 @@ func roleBindings() map[string][]rbacv1.RoleBinding {
 // For some reason the core helpers don't have any methods for adding namespaced users, only namespaced service accounts.
 func RoleBindingNamespacedUsers(r *rbacv1helpers.RoleBindingBuilder, namespace string, users ...string) *rbacv1helpers.RoleBindingBuilder {
 	for _, user := range users {
-		r.RoleBinding.Subjects = append(r.RoleBinding.Subjects, rbacv1.Subject{Kind: rbacv1.UserKind, Namespace: namespace, Name: user})
+		r.RoleBinding.Subjects = append(r.RoleBinding.Subjects, rbacv1.Subject{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Namespace: namespace, Name: user})
 	}
 	return r
 }
@@ -113,7 +119,7 @@ func RoleBindingName(r *rbacv1helpers.RoleBindingBuilder, name string) *rbacv1he
 // For some reason the core helpers don't have any methods for adding namespaced users, only namespaced service accounts.
 func ClusterRoleBindingNamespacedUsers(r *rbacv1helpers.ClusterRoleBindingBuilder, namespace string, users ...string) *rbacv1helpers.ClusterRoleBindingBuilder {
 	for _, user := range users {
-		r.ClusterRoleBinding.Subjects = append(r.ClusterRoleBinding.Subjects, rbacv1.Subject{Kind: rbacv1.UserKind, Namespace: namespace, Name: user})
+		r.ClusterRoleBinding.Subjects = append(r.ClusterRoleBinding.Subjects, rbacv1.Subject{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Namespace: namespace, Name: user})
 	}
 	return r
 }

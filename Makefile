@@ -17,7 +17,7 @@ ci-shell: clean .dapper                  ## Launch a shell in the CI environment
 .PHONY: dapper-ci
 dapper-ci: .ci                           ## Used by Drone CI, does the same as "ci" but in a Drone way
 
-.ci: validate build package
+.ci: validate validate-charts build package
 
 .PHONY: build
 build:                                   ## Build using host go tools
@@ -47,21 +47,17 @@ build-images:                             ## Build all images and image tarballs
 build-windows-images:                     ## Build only the Windows images and tarballs (including airgap)
 	./scripts/build-windows-images
 
-.PHONY: build-image-kubernetes
-build-image-kubernetes:                   ## Build the kubernetes image
-	./scripts/build-image-kubernetes
-
 .PHONY: build-image-runtime
 build-image-runtime:                      ## Build the runtime image
 	./scripts/build-image-runtime
 
-.PHONY: publish-image-kubernetes
-publish-image-kubernetes: build-image-kubernetes
-	./scripts/publish-image-kubernetes
-
 .PHONY: publish-image-runtime
-publish-image-runtime: build-image-runtime
+publish-image-runtime:
 	./scripts/publish-image-runtime
+
+.PHONY: publish-image-runtime-windows
+publish-image-runtime-windows:
+	./scripts/publish-image-runtime-windows
 
 .PHONY: validate
 validate:                                ## Run go fmt/vet
@@ -70,6 +66,11 @@ validate:                                ## Run go fmt/vet
 .PHONY: validate-release
 validate-release: 
 	./scripts/validate-release
+
+.PHONY: validate-charts
+validate-charts:
+	./scripts/validate-charts
+
 
 .PHONY: run
 run: build-debug
@@ -115,9 +116,13 @@ dev-peer-enter:                         ## Enter the peer shell on another termi
 publish-manifest-kubernetes: build-image-kubernetes						## Create and push the kubernetes manifest
 	./scripts/publish-manifest-kubernetes
 
-.PHONY: dispatch
-dispatch:								## Send dispatch event to rke2-upgrade repo
-	./scripts/dispatch
+.PHONY: publish-manifest-runtime
+publish-manifest-runtime:  						   ## Create and push the runtime manifest
+	./scripts/publish-manifest-runtime
+
+.PHONY: publish-binary
+publish-binary: 						## Upload binaries
+	./scripts/publish-binary
 
 .PHONY: package
 package: build 						## Package the rke2 binary
@@ -131,6 +136,10 @@ package-images: build-images		## Package docker images for airgap environment
 package-windows-images: build-windows-images		## Package Windows crane images for airgap environment
 	./scripts/package-windows-images
 
+.PHONY: package-image-runtime
+package-image-runtime: build-image-runtime		## Package runtime image for GH Actions testing
+	./scripts/package-image-runtime
+
 .PHONY: package-bundle
 package-bundle: build-binary					## Package the tarball bundle
 	./scripts/package-bundle
@@ -140,19 +149,19 @@ package-windows-bundle: build-windows-binary	## Package the Windows tarball bund
 	./scripts/package-windows-bundle
 
 .PHONY: test
-test: codespell-test unit-tests integration-tests
+test: test-unit test-docker
 
-.PHONY: codespell-test
-codespell-test:
-	./scripts/codespell.sh
+.PHONY: test-unit
+unit-test:
+	./scripts/test-unit
 
-.PHONY: unit-tests
-unit-tests:
-	./scripts/unit-tests
-
-.PHONY: integration-tests
-integration-tests:
+.PHONY: test-docker
+test-docker:
 	./scripts/test
+
+.PHONY: checksum
+checksum:
+	./scripts/checksum
 
 ./.dapper:
 	@echo Downloading dapper
@@ -174,4 +183,3 @@ serve-docs: mkdocs
 
 mkdocs:
 	docker build -t mkdocs -f Dockerfile.docs .
-

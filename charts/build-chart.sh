@@ -7,7 +7,7 @@ set -eux -o pipefail
 : "${CHART_NAME:="$(basename "${CHART_FILE%%.yaml}")"}"
 : "${CHART_PACKAGE:="${CHART_NAME%%-crd}"}"
 : "${TAR_OPTS:=--owner=0 --group=0 --mode=gou-s+r --numeric-owner --no-acls --no-selinux --no-xattrs}"
-: "${CHART_URL:="${CHART_REPO:="https://rke2-charts.rancher.io"}/assets/${CHART_PACKAGE}/${CHART_NAME}-${CHART_VERSION:="v0.0.0"}.tgz"}"
+: "${CHART_URL:="${CHART_REPO:="https://rke2-charts.rancher.io"}/assets/${CHART_PACKAGE}/${CHART_NAME}-${CHART_VERSION:="0.0.0"}.tgz"}"
 : "${CHART_TMP:=$(mktemp --suffix .tar.gz)}"
 : "${YAML_TMP:=$(mktemp --suffix .yaml)}"
 
@@ -18,6 +18,11 @@ cleanup() {
   exit ${exit_code}
 }
 trap cleanup EXIT INT
+
+if [ "$CHART_VERSION" == "0.0.0" ]; then
+  echo "# ${CHART_NAME} has been removed" > "${CHART_FILE}"
+  exit
+fi
 
 curl -fsSL "${CHART_URL}" -o "${CHART_TMP}"
 gunzip ${CHART_TMP}
@@ -38,6 +43,7 @@ metadata:
   namespace: "${CHART_NAMESPACE:="kube-system"}"
   annotations:
     helm.cattle.io/chart-url: "${CHART_URL}"
+    rke2.cattle.io/inject-cluster-config: "true"
 spec:
   bootstrap: ${CHART_BOOTSTRAP:=false}
   chartContent: $(base64 -w0 < "${CHART_TMP}")

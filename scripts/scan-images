@@ -2,31 +2,37 @@
 
 cd $(dirname $0)/..
 
-EXITCODE=0
+SCAN_OUTPUT="trivy_scan_report.txt"
+rm "$SCAN_OUTPUT"
+
+# Download the Rancher OpenVEX Trivy report
+curl -fsSO https://raw.githubusercontent.com/rancher/vexhub/refs/heads/main/reports/rancher.openvex.json
+
 for IMAGE in $(cat build/images*.txt); do
-  echo -e "\nScanning ${IMAGE}"
-  trivy image \
-    --format json \
-    --output trivy.json \
-    --exit-code 1 \
-    --severity ${SEVERITIES:-HIGH,CRITICAL} \
-    --no-progress \
-    --ignore-unfixed \
-    ${IMAGE}
-  RC=$?
-  if [ ${RC} -gt ${EXITCODE} ]; then
-    EXITCODE=${RC}
-  fi
-  if [ ${RC} -gt 0 ]; then
-    echo -e "\nSev\tPackage\tVulnID\tInstalled\tFixed"
-    jq -rc '.[0].Vulnerabilities[] | "\(.Severity)\t\(.PkgName)\t\(.VulnerabilityID)\t\(.InstalledVersion)\t\(.FixedVersion)"' trivy.json
-  fi
-  echo
-  rm trivy.json
+    echo "Scanning image: $IMAGE"
+    
+    # Run Trivy scan and append the report to the output file
+    trivy image "${IMAGE}" -q --no-progress \
+      --severity ${SEVERITIES:-CRITICAL,HIGH} \
+      --ignore-unfixed --show-suppressed \
+      --vex rancher.openvex.json >> "$SCAN_OUTPUT"
+    
+    if [ "$1" = "dump-report" ]; then
+      trivy image "${IMAGE}" -q --no-progress \
+      --severity ${SEVERITIES:-CRITICAL,HIGH} \
+      --ignore-unfixed \
+      -f json \
+      --exit-code 1 \
+      --vex rancher.openvex.json > "temp.json"
+      RC=$?
+      if [ ${RC} -gt 0 ]; then
+        echo -e "\nSev\tPackage\tVulnID\tInstalled\tFixed"
+        jq -rc '.Results[].Vulnerabilities | select( . != null ) | .[] | "\(.Severity)\t\(.PkgName)\t\(.VulnerabilityID)\t\(.InstalledVersion)\t\(.FixedVersion)"' "temp.json" | sort
+        echo
+      fi
+    fi
 done
 
-if [ ${EXITCODE} -gt 0 ]; then
-  echo "VULNERABILITIES FOUND"
-fi
-
-exit ${EXITCODE}
+rm rancher.openvex.json
+[ "$1" = "dump-report" ] && rm temp.json
+echo "Trivy scan completed. Reports are saved in $SCAN_OUTPUT."

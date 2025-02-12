@@ -13,22 +13,28 @@ else
     DEBUG_GO_GCFLAGS='-gcflags=all=-N -l'
 fi
 
+if [ -n "${GOCOVER}" ]; then
+    GO_BUILDTAGS="${GO_BUILDTAGS} cover"
+    GO_BUILD_FLAGS="${GO_BUILD_FLAGS} -cover"
+fi
+
 REVISION=$(git rev-parse HEAD)$(if ! git diff --no-ext-diff --quiet --exit-code; then echo .dirty; fi)
 RELEASE=${PROG}.${GOOS}-${GOARCH}
 
-BUILDTAGS="selinux netgo osusergo no_stage static_build sqlite_omit_load_extension"
+BUILDTAGS="selinux netgo osusergo no_stage static_build sqlite_omit_load_extension no_embedded_executor no_cri_dockerd"
 GO_BUILDTAGS="${GO_BUILDTAGS} ${BUILDTAGS} ${DEBUG_TAGS}"
 
 VERSION_FLAGS="
-        -X ${K3S_PKG}/pkg/version.GitCommit=${REVISION}
-        -X ${K3S_PKG}/pkg/version.Program=${PROG}
-        -X ${K3S_PKG}/pkg/version.Version=${VERSION}
-        -X ${RKE2_PKG}/pkg/images.DefaultRegistry=${REGISTRY}
-        -X ${RKE2_PKG}/pkg/images.DefaultEtcdImage=rancher/hardened-etcd:${ETCD_VERSION}-build20220504
-        -X ${RKE2_PKG}/pkg/images.DefaultKubernetesImage=rancher/hardened-kubernetes:${KUBERNETES_IMAGE_TAG}
-        -X ${RKE2_PKG}/pkg/images.DefaultPauseImage=rancher/pause:${PAUSE_VERSION}
-        -X ${RKE2_PKG}/pkg/images.DefaultRuntimeImage=${REPO}/${PROG}-runtime:${DOCKERIZED_VERSION}
-        -X ${RKE2_PKG}/pkg/images.DefaultCloudControllerManagerImage=rancher/rke2-cloud-provider:${CCM_VERSION}
+    -X ${K3S_PKG}/pkg/version.GitCommit=${REVISION}
+    -X ${K3S_PKG}/pkg/version.Program=${PROG}
+    -X ${K3S_PKG}/pkg/version.Version=${VERSION}
+    -X ${K3S_PKG}/pkg/version.UpstreamGolang=${VERSION_GOLANG}
+    -X ${RKE2_PKG}/pkg/images.DefaultRegistry=${REGISTRY}
+    -X ${RKE2_PKG}/pkg/images.DefaultEtcdImage=rancher/hardened-etcd:${ETCD_VERSION}-build20250210
+    -X ${RKE2_PKG}/pkg/images.DefaultKubernetesImage=rancher/hardened-kubernetes:${KUBERNETES_IMAGE_TAG}
+    -X ${RKE2_PKG}/pkg/images.DefaultPauseImage=rancher/mirrored-pause:${PAUSE_VERSION}
+    -X ${RKE2_PKG}/pkg/images.DefaultRuntimeImage=${REPO}/${PROG}-runtime:${DOCKERIZED_VERSION}
+    -X ${RKE2_PKG}/pkg/images.DefaultCloudControllerManagerImage=rancher/rke2-cloud-provider:${CCM_VERSION}
 "
 
 #STATIC_FLAGS='-extldflags "-static -Wl,--fatal-warnings"'
@@ -42,7 +48,9 @@ STATIC_FLAGS='-extldflags "-static"'
 
 GO_LDFLAGS="${STATIC_FLAGS} ${EXTRA_LDFLAGS}"
 echo ${DEBUG_GO_GCFLAGS}
-go build \
+
+# passing boringcrypto to GOEXPERIMENT variable to build with goboring library
+GOEXPERIMENT=boringcrypto go build \
     -tags "${GO_BUILDTAGS}" \
     ${GO_GCFLAGS} ${GO_BUILD_FLAGS} \
     -o bin/${PROG} \
@@ -54,9 +62,9 @@ if type -a go-assert-static.sh >/dev/null 2>&1; then
     go-assert-static.sh bin/${PROG}
 fi
 
-if [ "${GOARCH}" != "s390x" ]; then
-  # assert that rke2 is linked to goboring
-  if type -a go-assert-boring.sh >/dev/null 2>&1; then
-    go-assert-boring.sh bin/${PROG}
-  fi
+if [ "${GOARCH}" = "amd64" ]; then
+    # assert that rke2 is linked to goboring
+    if type -a go-assert-boring.sh >/dev/null 2>&1; then
+        go-assert-boring.sh bin/${PROG}
+    fi
 fi

@@ -4,89 +4,66 @@ import (
 	"github.com/k3s-io/k3s/pkg/cli/cmds"
 	"github.com/k3s-io/k3s/pkg/cli/etcdsnapshot"
 	"github.com/k3s-io/k3s/pkg/configfilearg"
-	"github.com/rancher/rke2/pkg/rke2"
 	"github.com/urfave/cli"
 )
 
 const defaultSnapshotRentention = 5
 
-var k3sFlags = map[string]*K3SFlagOption{
-	"config":          copy,
-	"debug":           copy,
-	"log":             copy,
-	"alsologtostderr": copy,
-	"node-name":       copy,
-	"data-dir": {
-		Usage:   "(data) Folder to hold state",
-		Default: rke2Path,
-	},
-	"name":               copy,
-	"dir":                copy,
-	"snapshot-compress":  copy,
-	"s3":                 copy,
-	"s3-endpoint":        copy,
-	"s3-endpoint-ca":     copy,
-	"s3-skip-ssl-verify": copy,
-	"s3-access-key":      copy,
-	"s3-secret-key":      copy,
-	"s3-bucket":          copy,
-	"s3-region":          copy,
-	"s3-folder":          copy,
-	"s3-insecure":        copy,
-	"s3-timeout":         copy,
-}
-
-var subcommands = []cli.Command{
-	{
-		Name:            "delete",
-		Usage:           "Delete given snapshot(s)",
-		SkipFlagParsing: false,
-		SkipArgReorder:  true,
-		Action:          etcdsnapshot.Delete,
-		Flags:           cmds.EtcdSnapshotFlags,
-	},
-	{
-		Name:            "ls",
-		Aliases:         []string{"list", "l"},
-		Usage:           "List snapshots",
-		SkipFlagParsing: false,
-		SkipArgReorder:  true,
-		Action:          etcdsnapshot.List,
-		Flags:           cmds.EtcdSnapshotFlags,
-	},
-	{
-		Name:            "prune",
-		Usage:           "Remove snapshots that exceed the configured retention count",
-		SkipFlagParsing: false,
-		SkipArgReorder:  true,
-		Action:          etcdsnapshot.Prune,
-		Flags: append(cmds.EtcdSnapshotFlags, &cli.IntFlag{
-			Name:        "snapshot-retention",
-			Usage:       "(db) Number of snapshots to retain. Default: 5",
-			Destination: &cmds.ServerConfig.EtcdSnapshotRetention,
-			Value:       defaultSnapshotRentention,
-		}),
-	},
-	{
-		Name:            "save",
-		Usage:           "Trigger an immediate etcd snapshot",
-		SkipFlagParsing: false,
-		SkipArgReorder:  true,
-		Action:          etcdsnapshot.Run,
-		Flags:           cmds.EtcdSnapshotFlags,
-	},
-}
-
-var (
-	k3sEtcdSnapshotBase = mustCmdFromK3S(cmds.NewEtcdSnapshotCommand(EtcdSnapshotRun, subcommands), k3sFlags)
-)
-
 func NewEtcdSnapshotCommand() cli.Command {
-	cmd := k3sEtcdSnapshotBase
+	cmds.ServerConfig.ClusterInit = true
+	k3sOpts := K3SFlagSet{
+		"config":          copyFlag,
+		"debug":           copyFlag,
+		"log":             copyFlag,
+		"alsologtostderr": copyFlag,
+		"node-name":       copyFlag,
+		"data-dir": {
+			Usage:   "(data) Folder to hold state",
+			Default: rke2Path,
+		},
+		"etcd-server": {
+			Default: "https://127.0.0.1:9345",
+		},
+		"etcd-token":         copyFlag,
+		"name":               copyFlag,
+		"dir":                copyFlag,
+		"snapshot-compress":  copyFlag,
+		"snapshot-retention": copyFlag,
+		"s3":                 copyFlag,
+		"s3-access-key":      copyFlag,
+		"s3-bucket":          copyFlag,
+		"s3-config-secret":   copyFlag,
+		"s3-endpoint":        copyFlag,
+		"s3-endpoint-ca":     copyFlag,
+		"s3-folder":          copyFlag,
+		"s3-insecure":        copyFlag,
+		"s3-proxy":           copyFlag,
+		"s3-region":          copyFlag,
+		"s3-secret-key":      copyFlag,
+		"s3-session-token":   copyFlag,
+		"s3-skip-ssl-verify": copyFlag,
+		"s3-timeout":         copyFlag,
+	}
+	subcommandOpts := map[string]K3SFlagSet{
+		"ls": {
+			"output": copyFlag,
+		},
+	}
+
+	command := cmds.NewEtcdSnapshotCommands(
+		etcdsnapshot.Delete,
+		etcdsnapshot.List,
+		etcdsnapshot.Prune,
+		etcdsnapshot.Save)
+	for i, subcommand := range command.Subcommands {
+		if s, ok := subcommandOpts[subcommand.Name]; ok {
+			k3sOpts.CopyInto(s)
+			command.Subcommands[i] = mustCmdFromK3S(subcommand, s)
+		} else {
+			command.Subcommands[i] = mustCmdFromK3S(subcommand, k3sOpts)
+		}
+	}
+	cmd := mustCmdFromK3S(command, k3sOpts)
 	configfilearg.DefaultParser.ValidFlags[cmd.Name] = cmd.Flags
 	return cmd
-}
-
-func EtcdSnapshotRun(clx *cli.Context) error {
-	return rke2.EtcdSnapshot(clx, config)
 }
